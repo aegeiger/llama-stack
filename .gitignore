@@ -31,3 +31,11 @@ CLAUDE.md
 .claude/
 docs/.docusaurus/
 docs/node_modules/
+
+# Ignroe generated files
+client-sdks/openapi/sdks
+client-sdks/openapi/api-hierarchy.yml
+client-sdks/openapi/openapi.generator.yml
+client-sdks/openapi/openapi-processed.yml
+client-sdks/openapi/patches-processed.yml
+

@@ -1,0 +1,8 @@
+{
+  "packageName": "llama_stack_client",
+  "projectName": "llama-stack-client",
+  "packageVersion": "0.3.5",
+  "removeOperationIdPrefix": true,
+  "removeOperationIdPrefixDelimiter": "_",
+  "useOneOfDiscriminatorLookup": true
+}
