@@ -1,0 +1,53 @@
+# Example patch file for merge_stainless_to_openapi.py
+#
+# This file demonstrates how to apply additional modifications to the
+# OpenAPI spec after merging Stainless configuration.
+#
+# Available actions:
+# - set: Set or overwrite a value at the specified path
+# - delete: Delete a key from the spec
+# - remove_item: Remove an item from a list
+# - append: Add an item to a list
+# - merge: Merge a dict into an existing dict
+
+operations:
+  # Example: Add discriminator mapping to OpenAIResponseInput
+  - path: "components.schemas.OpenAIResponseInput.discriminator"
+    action: "set"
+    value:
+      propertyName: type
+      mapping:
+        text: "#/components/schemas/TextInput"
+        image: "#/components/schemas/ImageInput"
+
+  # Example: Remove 'finish_reason' from required fields in OpenAICompletionChoice
+  - path: "components.schemas.OpenAICompletionChoice.required"
+    action: "remove_item"
+    value: "finish_reason"
+
+  # Example: Add a new property to a schema
+  - path: "components.schemas.SomeSchema.properties.newField"
+    action: "set"
+    value:
+      type: string
+      description: "A new field added via patch"
+
+  # Example: Delete a deprecated endpoint
+  # - path: "paths./v1/deprecated-endpoint"
+  #   action: "delete"
+
+  # Example: Add a tag to the global tags list
+  # - path: "tags"
+  #   action: "append"
+  #   value:
+  #     name: "CustomTag"
+  #     description: "A custom tag"
+
+  # Example: Merge additional security schemes
+  # - path: "components.securitySchemes"
+  #   action: "merge"
+  #   value:
+  #     ApiKeyAuth:
+  #       type: apiKey
+  #       in: header
+  #       name: X-API-Key
