@@ -351,12 +351,7 @@ resources:
       retrieve: get /v1/models/{model_id}
       register: post /v1/models
       unregister: delete /v1/models/{model_id}
-    subresources:
-      openai:
-        methods:
-          list:
-            paginated: false
-            endpoint: get /v1/models
+
   providers:
     methods:
       list:
@@ -463,8 +458,6 @@ resources:
         methods:
           evaluate_rows: post /v1alpha/eval/benchmarks/{benchmark_id}/evaluations
           run_eval: post /v1alpha/eval/benchmarks/{benchmark_id}/jobs
-          evaluate_rows_alpha: post /v1alpha/eval/benchmarks/{benchmark_id}/evaluations
-          run_eval_alpha: post /v1alpha/eval/benchmarks/{benchmark_id}/jobs
         subresources:
           jobs:
             methods:

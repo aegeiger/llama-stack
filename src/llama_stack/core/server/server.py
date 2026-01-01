@@ -88,7 +88,7 @@ async def global_exception_handler(request: Request, exc: Exception):
     traceback.print_exception(type(exc), exc, exc.__traceback__)
     http_exc = translate_exception(exc)
 
-    return JSONResponse(status_code=http_exc.status_code, content={"error": {"detail": http_exc.detail}})
+    return JSONResponse(status_code=http_exc.status_code, content=http_exc.detail)
 
 
 def translate_exception(exc: Exception) -> HTTPException | RequestValidationError:
@@ -98,16 +98,14 @@ def translate_exception(exc: Exception) -> HTTPException | RequestValidationErro
     if isinstance(exc, RequestValidationError):
         return HTTPException(
             status_code=httpx.codes.BAD_REQUEST,
-            detail={
-                "errors": [
-                    {
-                        "loc": list(error["loc"]),
-                        "msg": error["msg"],
-                        "type": error["type"],
-                    }
-                    for error in exc.errors()
-                ]
-            },
+            detail=[
+                {
+                    "loc": list(error["loc"]),
+                    "msg": error["msg"],
+                    "type": error["type"],
+                }
+                for error in exc.errors()
+            ],
         )
     elif isinstance(exc, ConflictError):
         return HTTPException(status_code=httpx.codes.CONFLICT, detail=str(exc))

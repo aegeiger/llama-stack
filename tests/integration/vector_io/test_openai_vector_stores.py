@@ -9,6 +9,7 @@ from io import BytesIO
 
 import pytest
 from llama_stack_client import BadRequestError
+from llama_stack_client.exceptions import BadRequestException
 from openai import BadRequestError as OpenAIBadRequestError
 
 from llama_stack.core.library_client import LlamaStackAsLibraryClient
@@ -18,6 +19,44 @@ from llama_stack_api import Chunk, ExpiresAfter
 from ..conftest import vector_provider_wrapper
 
 logger = get_logger(name=__name__, category="vector_io")
+
+
+def get_file_content(client, vector_store_id, file_id, include_embeddings=None, include_metadata=None):
+    """
+    Get file content from vector store, handling both OpenAI and LlamaStack clients.
+
+    OpenAI client uses extra_query parameter, while LlamaStackClient uses direct parameters.
+    """
+    from openai import OpenAI
+
+    if isinstance(client, OpenAI):
+        # OpenAI client: use extra_query
+        extra_query = {}
+        if include_embeddings is not None:
+            extra_query["include_embeddings"] = include_embeddings
+        if include_metadata is not None:
+            extra_query["include_metadata"] = include_metadata
+
+        if extra_query:
+            return client.vector_stores.files.content(
+                vector_store_id=vector_store_id,
+                file_id=file_id,
+                extra_query=extra_query,
+            )
+        else:
+            return client.vector_stores.files.content(
+                vector_store_id=vector_store_id,
+                file_id=file_id,
+            )
+    else:
+        # LlamaStackClient: use direct parameters
+        kwargs = {"vector_store_id": vector_store_id, "file_id": file_id}
+        if include_embeddings is not None:
+            kwargs["include_embeddings"] = include_embeddings
+        if include_metadata is not None:
+            kwargs["include_metadata"] = include_metadata
+
+        return client.vector_stores.files.content(**kwargs)
 
 
 def skip_if_provider_doesnt_support_openai_vector_stores(client_with_models):
@@ -130,9 +169,9 @@ def compat_client_with_empty_stores(compat_client):
             response = compat_client.vector_stores.list()
             for store in response.data:
                 compat_client.vector_stores.delete(vector_store_id=store.id)
-        except Exception:
+        except Exception as e:
             # If the API is not available or fails, just continue
-            logger.warning("Failed to clear vector stores")
+            logger.warning(f"Failed to clear vector stores: {e}")
             pass
 
     def clear_files():
@@ -140,9 +179,9 @@ def compat_client_with_empty_stores(compat_client):
             response = compat_client.files.list()
             for file in response.data:
                 compat_client.files.delete(file_id=file.id)
-        except Exception:
+        except Exception as e:
             # If the API is not available or fails, just continue
-            logger.warning("Failed to clear files")
+            logger.warning(f"Failed to clear files: {e}")
             pass
 
     clear_vector_stores()
@@ -858,7 +897,7 @@ def test_openai_vector_store_list_files_invalid_vector_store(
     if isinstance(compat_client, LlamaStackAsLibraryClient):
         errors = ValueError
     else:
-        errors = (BadRequestError, OpenAIBadRequestError)
+        errors = (BadRequestError, OpenAIBadRequestError, BadRequestException)
 
     with pytest.raises(errors):
         compat_client.vector_stores.files.list(vector_store_id="abc123")
@@ -1537,7 +1576,7 @@ def test_openai_vector_store_file_batch_error_handling(
     if isinstance(compat_client, LlamaStackAsLibraryClient):
         batch_errors = ValueError
     else:
-        batch_errors = (BadRequestError, OpenAIBadRequestError)
+        batch_errors = (BadRequestError, OpenAIBadRequestError, BadRequestException)
 
     with pytest.raises(batch_errors):  # Should raise an error for non-existent batch
         compat_client.vector_stores.file_batches.retrieve(
@@ -1549,7 +1588,7 @@ def test_openai_vector_store_file_batch_error_handling(
     if isinstance(compat_client, LlamaStackAsLibraryClient):
         vector_store_errors = ValueError
     else:
-        vector_store_errors = (BadRequestError, OpenAIBadRequestError)
+        vector_store_errors = (BadRequestError, OpenAIBadRequestError, BadRequestException)
 
     with pytest.raises(vector_store_errors):  # Should raise an error for non-existent vector store
         compat_client.vector_stores.file_batches.create(
@@ -1649,17 +1688,20 @@ def test_openai_vector_store_file_contents_with_extra_query(
     # Wait for processing
     time.sleep(2)
 
-    # Test that extra_query parameter is accepted and processed
-    content_with_extra_query = compat_client.vector_stores.files.content(
-        vector_store_id=vector_store.id,
-        file_id=file.id,
-        extra_query={"include_embeddings": True, "include_metadata": True},
+    # Test that include_embeddings and include_metadata parameters are accepted and processed
+    content_with_extra_query = get_file_content(
+        compat_client,
+        vector_store.id,
+        file.id,
+        include_embeddings=True,
+        include_metadata=True,
     )
 
-    # Test without extra_query for comparison
-    content_without_extra_query = compat_client.vector_stores.files.content(
-        vector_store_id=vector_store.id,
-        file_id=file.id,
+    # Test without extra parameters for comparison
+    content_without_extra_query = get_file_content(
+        compat_client,
+        vector_store.id,
+        file.id,
     )
 
     # Validate that both calls succeed
@@ -1668,7 +1710,7 @@ def test_openai_vector_store_file_contents_with_extra_query(
     assert len(content_with_extra_query.data) > 0
     assert len(content_without_extra_query.data) > 0
 
-    # Validate that extra_query parameter is processed correctly
+    # Validate that include_embeddings and include_metadata parameters are processed correctly
     # Both should have the embedding/metadata fields available (may be None based on flags)
     first_chunk_with_flags = content_with_extra_query.data[0]
     first_chunk_without_flags = content_without_extra_query.data[0]
@@ -1740,7 +1782,7 @@ def test_openai_vector_store_search_with_rewrite_query(
     assert response_no_rewrite is not None
 
     # Test rewrite_query=True should fail with proper error when no LLM models are configured
-    with pytest.raises((BadRequestError, OpenAIBadRequestError, ValueError)) as exc_info:
+    with pytest.raises((BadRequestError, OpenAIBadRequestError, BadRequestException, ValueError)) as exc_info:
         compat_client.vector_stores.search(
             vector_store_id=vector_store.id,
             query="programming",
