@@ -101,7 +101,7 @@ def _validate_file_input(v: Any) -> Any:
     - tuples of (filename, content)
     """
     # If it's already bytes or str, pass through
-    if isinstance(v, (bytes, str)):
+    if isinstance(v, bytes | str):
         return v
 
     # If it's a tuple (filename, content), validate the content part
