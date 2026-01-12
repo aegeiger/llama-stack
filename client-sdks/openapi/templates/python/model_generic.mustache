@@ -299,11 +299,13 @@ class {{classname}}({{#parent}}{{{.}}}{{/parent}}{{^parent}}BaseModel{{/parent}}
         _field_dict = {}
         if self.{{{name}}}:
             for _key_{{{name}}} in self.{{{name}}}:
-                if self.{{{name}}}[_key_{{{name}}}]:
-                    if hasattr(self.{{{name}}}[_key_{{{name}}}], 'to_dict'):
-                        _field_dict[_key_{{{name}}}] = self.{{{name}}}[_key_{{{name}}}].to_dict()
-                    else:
-                        _field_dict[_key_{{{name}}}] = self.{{{name}}}[_key_{{{name}}}]
+                _val = self.{{{name}}}[_key_{{{name}}}]
+                if _val is None:
+                    _field_dict[_key_{{{name}}}] = None
+                elif hasattr(_val, 'to_dict'):
+                    _field_dict[_key_{{{name}}}] = _val.to_dict()
+                else:
+                    _field_dict[_key_{{{name}}}] = _val
             _dict['{{{baseName}}}'] = _field_dict
         {{/items.isEnumOrRef}}
         {{/items.isPrimitiveType}}
