@@ -9,7 +9,6 @@ from io import BytesIO
 
 import pytest
 from llama_stack_client import BadRequestError
-from llama_stack_client.exceptions import BadRequestException
 from openai import BadRequestError as OpenAIBadRequestError
 
 from llama_stack.core.library_client import LlamaStackAsLibraryClient
@@ -897,7 +896,7 @@ def test_openai_vector_store_list_files_invalid_vector_store(
     if isinstance(compat_client, LlamaStackAsLibraryClient):
         errors = ValueError
     else:
-        errors = (BadRequestError, OpenAIBadRequestError, BadRequestException)
+        errors = (BadRequestError, OpenAIBadRequestError)
 
     with pytest.raises(errors):
         compat_client.vector_stores.files.list(vector_store_id="abc123")
@@ -1576,7 +1575,7 @@ def test_openai_vector_store_file_batch_error_handling(
     if isinstance(compat_client, LlamaStackAsLibraryClient):
         batch_errors = ValueError
     else:
-        batch_errors = (BadRequestError, OpenAIBadRequestError, BadRequestException)
+        batch_errors = (BadRequestError, OpenAIBadRequestError)
 
     with pytest.raises(batch_errors):  # Should raise an error for non-existent batch
         compat_client.vector_stores.file_batches.retrieve(
@@ -1588,7 +1587,7 @@ def test_openai_vector_store_file_batch_error_handling(
     if isinstance(compat_client, LlamaStackAsLibraryClient):
         vector_store_errors = ValueError
     else:
-        vector_store_errors = (BadRequestError, OpenAIBadRequestError, BadRequestException)
+        vector_store_errors = (BadRequestError, OpenAIBadRequestError)
 
     with pytest.raises(vector_store_errors):  # Should raise an error for non-existent vector store
         compat_client.vector_stores.file_batches.create(
@@ -1782,7 +1781,7 @@ def test_openai_vector_store_search_with_rewrite_query(
     assert response_no_rewrite is not None
 
     # Test rewrite_query=True should fail with proper error when no LLM models are configured
-    with pytest.raises((BadRequestError, OpenAIBadRequestError, BadRequestException, ValueError)) as exc_info:
+    with pytest.raises((BadRequestError, OpenAIBadRequestError, ValueError)) as exc_info:
         compat_client.vector_stores.search(
             vector_store_id=vector_store.id,
             query="programming",
