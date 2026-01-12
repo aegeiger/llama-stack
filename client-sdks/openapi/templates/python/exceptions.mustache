@@ -121,6 +121,16 @@ class ApiException(OpenApiException):
                     pass
             self.headers = http_resp.getheaders()
 
+    @property
+    def message(self) -> Optional[str]:
+        """Alias for reason to match httpx-style exceptions."""
+        return self.reason
+
+    @property
+    def status_code(self) -> Optional[int]:
+        """Alias for status to match httpx-style exceptions."""
+        return self.status
+
     @classmethod
     def from_response(
         cls,
@@ -147,6 +157,9 @@ class ApiException(OpenApiException):
 
         if http_resp.status == 422:
             raise UnprocessableEntityException(http_resp=http_resp, body=body, data=data)
+
+        if http_resp.status == 429:
+            raise RateLimitException(http_resp=http_resp, body=body, data=data)
 
         if 500 <= http_resp.status <= 599:
             raise ServiceException(http_resp=http_resp, body=body, data=data)
@@ -194,6 +207,22 @@ class ConflictException(ApiException):
 class UnprocessableEntityException(ApiException):
     """Exception for HTTP 422 Unprocessable Entity."""
     pass
+
+
+class RateLimitException(ApiException):
+    """Exception for HTTP 429 Rate Limit."""
+    pass
+
+
+# Aliases for compatibility with _exceptions.py naming convention
+BadRequestError = BadRequestException
+AuthenticationError = UnauthorizedException
+PermissionDeniedError = ForbiddenException
+NotFoundError = NotFoundException
+ConflictError = ConflictException
+UnprocessableEntityError = UnprocessableEntityException
+RateLimitError = RateLimitException
+InternalServerError = ServiceException
 
 
 def render_path(path_to_item):
