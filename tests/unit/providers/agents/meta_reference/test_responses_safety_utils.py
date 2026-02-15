@@ -8,8 +8,6 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from llama_stack.apis.agents.agents import ResponseGuardrailSpec
-from llama_stack.apis.safety import ModerationObject, ModerationObjectResults
 from llama_stack.providers.inline.agents.meta_reference.responses.openai_responses import (
     OpenAIResponsesImpl,
 )
@@ -17,6 +15,8 @@ from llama_stack.providers.inline.agents.meta_reference.responses.utils import (
     extract_guardrail_ids,
     run_guardrails,
 )
+from llama_stack_api.agents import ResponseGuardrailSpec
+from llama_stack_api.safety import ModerationObject, ModerationObjectResults
 
 
 @pytest.fixture
@@ -30,6 +30,9 @@ def mock_apis():
         "vector_io_api": AsyncMock(),
         "conversations_api": AsyncMock(),
         "safety_api": AsyncMock(),
+        "prompts_api": AsyncMock(),
+        "files_api": AsyncMock(),
+        "connectors_api": AsyncMock(),
     }
 
 
@@ -114,10 +117,12 @@ async def test_run_guardrails_no_violation(mock_safety_api):
     result = await run_guardrails(mock_safety_api, text, guardrail_ids)
 
     assert result is None
-    # Verify run_moderation was called with the correct model
+    # Verify run_moderation was called with the correct request object
     mock_safety_api.run_moderation.assert_called_once()
     call_args = mock_safety_api.run_moderation.call_args
-    assert call_args[1]["model"] == "llama-guard-model"
+    request = call_args[0][0]  # First positional argument is the RunModerationRequest
+    assert request.model == "llama-guard-model"
+    assert request.input == text
 
 
 async def test_run_guardrails_with_violation(mock_safety_api):

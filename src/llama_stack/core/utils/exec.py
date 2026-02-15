@@ -17,10 +17,10 @@ from llama_stack.log import get_logger
 log = get_logger(name=__name__, category="core")
 
 
-def formulate_run_args(image_type: str, image_name: str) -> list:
+def formulate_run_args(image_type: str, distro_name: str) -> list:
     # Only venv is supported now
     current_venv = os.environ.get("VIRTUAL_ENV")
-    env_name = image_name or current_venv
+    env_name = distro_name or current_venv
     if not env_name:
         cprint(
             "No current virtual environment detected, please specify a virtual environment name with --image-name",
@@ -84,6 +84,15 @@ def run_command(command: list[str]) -> int:
             text=True,
             check=False,
         )
+
+        # Print stdout and stderr if command failed
+        if result.returncode != 0:
+            log.error(f"Command {' '.join(command)} failed with returncode {result.returncode}")
+            if result.stdout:
+                log.error(f"STDOUT: {result.stdout}")
+            if result.stderr:
+                log.error(f"STDERR: {result.stderr}")
+
         return result.returncode
     except subprocess.SubprocessError as e:
         log.error(f"Subprocess error: {e}")

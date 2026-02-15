@@ -6,13 +6,14 @@
 
 from typing import Any
 
-from llama_stack.apis.inference import (
+from llama_stack.providers.utils.inference.openai_mixin import OpenAIMixin
+from llama_stack_api import (
     OpenAIEmbeddingData,
     OpenAIEmbeddingsRequestWithExtraBody,
     OpenAIEmbeddingsResponse,
     OpenAIEmbeddingUsage,
+    validate_embeddings_input_is_text,
 )
-from llama_stack.providers.utils.inference.openai_mixin import OpenAIMixin
 
 from .config import GeminiConfig
 
@@ -37,6 +38,9 @@ class GeminiInferenceAdapter(OpenAIMixin):
         Override embeddings method to handle Gemini's missing usage statistics.
         Gemini's embedding API doesn't return usage information, so we provide default values.
         """
+        # Validate that input contains only text, not token arrays
+        validate_embeddings_input_is_text(params)
+
         # Build request params conditionally to avoid NotGiven/Omit type mismatch
         request_params: dict[str, Any] = {
             "model": await self._get_provider_model_id(params.model),

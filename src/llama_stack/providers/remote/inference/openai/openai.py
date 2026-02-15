@@ -24,6 +24,8 @@ class OpenAIInferenceAdapter(OpenAIMixin):
 
     provider_data_api_key_field: str = "openai_api_key"
 
+    supports_tokenized_embeddings_input: bool = True
+
     embedding_model_metadata: dict[str, dict[str, int]] = {
         "text-embedding-3-small": {"embedding_dimension": 1536, "context_length": 8192},
         "text-embedding-3-large": {"embedding_dimension": 3072, "context_length": 8192},
@@ -35,4 +37,4 @@ class OpenAIInferenceAdapter(OpenAIMixin):
 
         Returns the OpenAI API base URL from the configuration.
         """
-        return self.config.base_url
+        return str(self.config.base_url)

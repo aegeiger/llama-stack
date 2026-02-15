@@ -5,7 +5,7 @@
 # the root directory of this source tree.
 
 
-from llama_stack.providers.datatypes import (
+from llama_stack_api import (
     Api,
     InlineProviderSpec,
     ProviderSpec,
@@ -28,14 +28,6 @@ META_REFERENCE_DEPS = [
 
 def available_providers() -> list[ProviderSpec]:
     return [
-        InlineProviderSpec(
-            api=Api.inference,
-            provider_type="inline::meta-reference",
-            pip_packages=META_REFERENCE_DEPS,
-            module="llama_stack.providers.inline.inference.meta_reference",
-            config_class="llama_stack.providers.inline.inference.meta_reference.MetaReferenceInferenceConfig",
-            description="Meta's reference implementation of inference with support for various model formats and optimization techniques.",
-        ),
         InlineProviderSpec(
             api=Api.inference,
             provider_type="inline::sentence-transformers",
@@ -127,7 +119,7 @@ def available_providers() -> list[ProviderSpec]:
             adapter_type="together",
             provider_type="remote::together",
             pip_packages=[
-                "together",
+                "together>=2",
             ],
             module="llama_stack.providers.remote.inference.together",
             config_class="llama_stack.providers.remote.inference.together.TogetherImplConfig",
@@ -138,10 +130,11 @@ def available_providers() -> list[ProviderSpec]:
             api=Api.inference,
             adapter_type="bedrock",
             provider_type="remote::bedrock",
-            pip_packages=["boto3"],
+            pip_packages=[],
             module="llama_stack.providers.remote.inference.bedrock",
             config_class="llama_stack.providers.remote.inference.bedrock.BedrockConfig",
-            description="AWS Bedrock inference provider for accessing various AI models through AWS's managed service.",
+            provider_data_validator="llama_stack.providers.remote.inference.bedrock.config.BedrockProviderDataValidator",
+            description="AWS Bedrock inference provider using OpenAI compatible endpoint.",
         ),
         RemoteProviderSpec(
             api=Api.inference,
@@ -222,7 +215,7 @@ def available_providers() -> list[ProviderSpec]:
 
 Configuration:
 - Set VERTEX_AI_PROJECT environment variable (required)
-- Set VERTEX_AI_LOCATION environment variable (optional, defaults to us-central1)
+- Set VERTEX_AI_LOCATION environment variable (optional, defaults to global)
 - Use Google Cloud Application Default Credentials or service account key
 
 Authentication Setup:
@@ -297,5 +290,28 @@ Azure OpenAI inference provider for accessing GPT models and other Azure service
 Provider documentation
 https://learn.microsoft.com/en-us/azure/ai-foundry/openai/overview
 """,
+        ),
+        RemoteProviderSpec(
+            api=Api.inference,
+            provider_type="remote::oci",
+            adapter_type="oci",
+            pip_packages=["oci"],
+            module="llama_stack.providers.remote.inference.oci",
+            config_class="llama_stack.providers.remote.inference.oci.config.OCIConfig",
+            provider_data_validator="llama_stack.providers.remote.inference.oci.config.OCIProviderDataValidator",
+            description="""
+Oracle Cloud Infrastructure (OCI) Generative AI inference provider for accessing OCI's Generative AI Platform-as-a-Service models.
+Provider documentation
+https://docs.oracle.com/en-us/iaas/Content/generative-ai/home.htm
+""",
+        ),
+        RemoteProviderSpec(
+            api=Api.inference,
+            adapter_type="llama-cpp-server",
+            provider_type="remote::llama-cpp-server",
+            pip_packages=[],
+            module="llama_stack.providers.remote.inference.llama_cpp_server",
+            config_class="llama_stack.providers.remote.inference.llama_cpp_server.config.LlamaCppServerConfig",
+            description="llama.cpp inference provider for connecting to llama.cpp servers with OpenAI-compatible API.",
         ),
     ]

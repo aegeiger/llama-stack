@@ -12,8 +12,8 @@ import pydantic
 
 from llama_stack.core.datatypes import RoutableObjectWithProvider
 from llama_stack.core.storage.datatypes import KVStoreReference
+from llama_stack.core.storage.kvstore import KVStore, kvstore_impl
 from llama_stack.log import get_logger
-from llama_stack.providers.utils.kvstore import KVStore, kvstore_impl
 
 logger = get_logger(__name__, category="core::registry")
 
@@ -190,7 +190,7 @@ class CachedDiskDistributionRegistry(DiskDistributionRegistry):
 
 
 async def create_dist_registry(
-    metadata_store: KVStoreReference, image_name: str
+    metadata_store: KVStoreReference, distro_name: str
 ) -> tuple[CachedDiskDistributionRegistry, KVStore]:
     # instantiate kvstore for storing and retrieving distribution metadata
     dist_kvstore = await kvstore_impl(metadata_store)

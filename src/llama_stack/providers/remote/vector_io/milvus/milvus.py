@@ -11,28 +11,39 @@ from typing import Any
 from numpy.typing import NDArray
 from pymilvus import AnnSearchRequest, DataType, Function, FunctionType, MilvusClient, RRFRanker, WeightedRanker
 
-from llama_stack.apis.common.errors import VectorStoreNotFoundError
-from llama_stack.apis.files import Files
-from llama_stack.apis.inference import Inference, InterleavedContent
-from llama_stack.apis.vector_io import Chunk, QueryChunksResponse, VectorIO
-from llama_stack.apis.vector_stores import VectorStore
+from llama_stack.core.storage.kvstore import kvstore_impl
 from llama_stack.log import get_logger
-from llama_stack.providers.datatypes import VectorStoresProtocolPrivate
 from llama_stack.providers.inline.vector_io.milvus import MilvusVectorIOConfig as InlineMilvusVectorIOConfig
-from llama_stack.providers.utils.kvstore import kvstore_impl
-from llama_stack.providers.utils.kvstore.api import KVStore
 from llama_stack.providers.utils.memory.openai_vector_store_mixin import OpenAIVectorStoreMixin
 from llama_stack.providers.utils.memory.vector_store import (
     RERANKER_TYPE_WEIGHTED,
-    ChunkForDeletion,
     EmbeddingIndex,
     VectorStoreWithIndex,
 )
-from llama_stack.providers.utils.vector_io.vector_utils import sanitize_collection_name
+from llama_stack.providers.utils.vector_io.vector_utils import (
+    load_embedded_chunk_with_backward_compat,
+    sanitize_collection_name,
+)
+from llama_stack_api import (
+    ChunkForDeletion,
+    DeleteChunksRequest,
+    EmbeddedChunk,
+    Files,
+    Inference,
+    InsertChunksRequest,
+    QueryChunksRequest,
+    QueryChunksResponse,
+    VectorIO,
+    VectorStore,
+    VectorStoreNotFoundError,
+    VectorStoresProtocolPrivate,
+)
+from llama_stack_api.internal.kvstore import KVStore
 
 from .config import MilvusVectorIOConfig as RemoteMilvusVectorIOConfig
 
 logger = get_logger(name=__name__, category="vector_io::milvus")
+
 
 VERSION = "v3"
 VECTOR_DBS_PREFIX = f"vector_stores:milvus:{VERSION}::"
@@ -60,10 +71,9 @@ class MilvusIndex(EmbeddingIndex):
         if await asyncio.to_thread(self.client.has_collection, self.collection_name):
             await asyncio.to_thread(self.client.drop_collection, collection_name=self.collection_name)
 
-    async def add_chunks(self, chunks: list[Chunk], embeddings: NDArray):
-        assert len(chunks) == len(embeddings), (
-            f"Chunk length {len(chunks)} does not match embedding length {len(embeddings)}"
-        )
+    async def add_chunks(self, chunks: list[EmbeddedChunk]):
+        if not chunks:
+            return
 
         if not await asyncio.to_thread(self.client.has_collection, self.collection_name):
             logger.info(f"Creating new collection {self.collection_name} with nullable sparse field")
@@ -76,7 +86,7 @@ class MilvusIndex(EmbeddingIndex):
                 max_length=65535,
                 enable_analyzer=True,  # Enable text analysis for BM25
             )
-            schema.add_field(field_name="vector", datatype=DataType.FLOAT_VECTOR, dim=len(embeddings[0]))
+            schema.add_field(field_name="vector", datatype=DataType.FLOAT_VECTOR, dim=len(chunks[0].embedding))
             schema.add_field(field_name="chunk_content", datatype=DataType.JSON)
             # Add sparse vector field for BM25 (required by the function)
             schema.add_field(field_name="sparse", datatype=DataType.SPARSE_FLOAT_VECTOR)
@@ -105,12 +115,12 @@ class MilvusIndex(EmbeddingIndex):
             )
 
         data = []
-        for chunk, embedding in zip(chunks, embeddings, strict=False):
+        for chunk in chunks:
             data.append(
                 {
                     "chunk_id": chunk.chunk_id,
                     "content": chunk.content,
-                    "vector": embedding,
+                    "vector": chunk.embedding,  # Already a list[float]
                     "chunk_content": chunk.model_dump(),
                     # sparse field will be handled by BM25 function automatically
                 }
@@ -131,7 +141,7 @@ class MilvusIndex(EmbeddingIndex):
             output_fields=["*"],
             search_params={"params": {"radius": score_threshold}},
         )
-        chunks = [Chunk(**res["entity"]["chunk_content"]) for res in search_res[0]]
+        chunks = [load_embedded_chunk_with_backward_compat(res["entity"]["chunk_content"]) for res in search_res[0]]
         scores = [res["distance"] for res in search_res[0]]
         return QueryChunksResponse(chunks=chunks, scores=scores)
 
@@ -158,7 +168,7 @@ class MilvusIndex(EmbeddingIndex):
             chunks = []
             scores = []
             for res in search_res[0]:
-                chunk = Chunk(**res["entity"]["chunk_content"])
+                chunk = load_embedded_chunk_with_backward_compat(res["entity"]["chunk_content"])
                 chunks.append(chunk)
                 scores.append(res["distance"])  # BM25 score from Milvus
 
@@ -186,7 +196,7 @@ class MilvusIndex(EmbeddingIndex):
             output_fields=["*"],
             limit=k,
         )
-        chunks = [Chunk(**res["chunk_content"]) for res in search_res]
+        chunks = [load_embedded_chunk_with_backward_compat(res["chunk_content"]) for res in search_res]
         scores = [1.0] * len(chunks)  # Simple binary score for text search
         return QueryChunksResponse(chunks=chunks, scores=scores)
 
@@ -238,7 +248,7 @@ class MilvusIndex(EmbeddingIndex):
         chunks = []
         scores = []
         for res in search_res[0]:
-            chunk = Chunk(**res["entity"]["chunk_content"])
+            chunk = load_embedded_chunk_with_backward_compat(res["entity"]["chunk_content"])
             chunks.append(chunk)
             scores.append(res["distance"])
 
@@ -268,11 +278,10 @@ class MilvusVectorIOAdapter(OpenAIVectorStoreMixin, VectorIO, VectorStoresProtoc
         inference_api: Inference,
         files_api: Files | None,
     ) -> None:
-        super().__init__(files_api=files_api, kvstore=None)
+        super().__init__(inference_api=inference_api, files_api=files_api, kvstore=None)
         self.config = config
         self.cache = {}
         self.client = None
-        self.inference_api = inference_api
         self.vector_store_table = None
         self.metadata_collection_name = "openai_vector_stores_metadata"
 
@@ -328,13 +337,16 @@ class MilvusVectorIOAdapter(OpenAIVectorStoreMixin, VectorIO, VectorStoresProtoc
         if vector_store_id in self.cache:
             return self.cache[vector_store_id]
 
-        if self.vector_store_table is None:
+        # Try to load from kvstore
+        if self.kvstore is None:
+            raise RuntimeError("KVStore not initialized. Call initialize() before using vector stores.")
+
+        key = f"{VECTOR_DBS_PREFIX}{vector_store_id}"
+        vector_store_data = await self.kvstore.get(key)
+        if not vector_store_data:
             raise VectorStoreNotFoundError(vector_store_id)
 
-        vector_store = await self.vector_store_table.get_vector_store(vector_store_id)
-        if not vector_store:
-            raise VectorStoreNotFoundError(vector_store_id)
-
+        vector_store = VectorStore.model_validate_json(vector_store_data)
         index = VectorStoreWithIndex(
             vector_store=vector_store,
             index=MilvusIndex(client=self.client, collection_name=vector_store.identifier, kvstore=self.kvstore),
@@ -348,25 +360,23 @@ class MilvusVectorIOAdapter(OpenAIVectorStoreMixin, VectorIO, VectorStoresProtoc
             await self.cache[vector_store_id].index.delete()
             del self.cache[vector_store_id]
 
-    async def insert_chunks(self, vector_store_id: str, chunks: list[Chunk], ttl_seconds: int | None = None) -> None:
-        index = await self._get_and_cache_vector_store_index(vector_store_id)
+    async def insert_chunks(self, request: InsertChunksRequest) -> None:
+        index = await self._get_and_cache_vector_store_index(request.vector_store_id)
         if not index:
-            raise VectorStoreNotFoundError(vector_store_id)
+            raise VectorStoreNotFoundError(request.vector_store_id)
 
-        await index.insert_chunks(chunks)
+        await index.insert_chunks(request)
 
-    async def query_chunks(
-        self, vector_store_id: str, query: InterleavedContent, params: dict[str, Any] | None = None
-    ) -> QueryChunksResponse:
-        index = await self._get_and_cache_vector_store_index(vector_store_id)
+    async def query_chunks(self, request: QueryChunksRequest) -> QueryChunksResponse:
+        index = await self._get_and_cache_vector_store_index(request.vector_store_id)
         if not index:
-            raise VectorStoreNotFoundError(vector_store_id)
-        return await index.query_chunks(query, params)
+            raise VectorStoreNotFoundError(request.vector_store_id)
+        return await index.query_chunks(request)
 
-    async def delete_chunks(self, store_id: str, chunks_for_deletion: list[ChunkForDeletion]) -> None:
+    async def delete_chunks(self, request: DeleteChunksRequest) -> None:
         """Delete a chunk from a milvus vector store."""
-        index = await self._get_and_cache_vector_store_index(store_id)
+        index = await self._get_and_cache_vector_store_index(request.vector_store_id)
         if not index:
-            raise VectorStoreNotFoundError(store_id)
+            raise VectorStoreNotFoundError(request.vector_store_id)
 
-        await index.index.delete_chunks(chunks_for_deletion)
+        await index.index.delete_chunks(request.chunks)

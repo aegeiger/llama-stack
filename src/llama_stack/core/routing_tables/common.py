@@ -6,9 +6,6 @@
 
 from typing import Any
 
-from llama_stack.apis.common.errors import ModelNotFoundError
-from llama_stack.apis.models import Model
-from llama_stack.apis.resource import ResourceType
 from llama_stack.core.access_control.access_control import AccessDeniedError, is_action_allowed
 from llama_stack.core.access_control.datatypes import Action
 from llama_stack.core.datatypes import (
@@ -21,7 +18,7 @@ from llama_stack.core.datatypes import (
 from llama_stack.core.request_headers import get_authenticated_user
 from llama_stack.core.store import DistributionRegistry
 from llama_stack.log import get_logger
-from llama_stack.providers.datatypes import Api, RoutingTable
+from llama_stack_api import Api, Model, ModelNotFoundError, ResourceType, RoutingTable
 
 logger = get_logger(name=__name__, category="core::routing_tables")
 
@@ -212,6 +209,17 @@ class CommonRoutingTableImpl(RoutingTable):
             logger.info(f"Setting owner for {obj.type} '{obj.identifier}' to {obj.owner.principal}")
 
         registered_obj = await register_object_with_provider(obj, p)
+
+        # Ensure OpenAI metadata exists for vector stores
+        if obj.type == ResourceType.vector_store.value:
+            if hasattr(p, "_ensure_openai_metadata_exists"):
+                await p._ensure_openai_metadata_exists(obj)
+            else:
+                logger.warning(
+                    f"Provider {obj.provider_id} does not support OpenAI metadata creation. "
+                    f"Vector store {obj.identifier} may not work with OpenAI-compatible APIs."
+                )
+
         # TODO: This needs to be fixed for all APIs once they return the registered object
         if obj.type == ResourceType.model.value:
             await self.dist_registry.register(registered_obj)

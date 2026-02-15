@@ -13,23 +13,48 @@ from abc import ABC, abstractmethod
 from typing import Annotated, Any
 
 from fastapi import Body
-from pydantic import TypeAdapter
 
-from llama_stack.apis.common.errors import VectorStoreNotFoundError
-from llama_stack.apis.files import Files, OpenAIFileObject
-from llama_stack.apis.vector_io import (
+from llama_stack.core.datatypes import VectorStoresConfig
+from llama_stack.core.id_generation import generate_object_id
+from llama_stack.log import get_logger
+from llama_stack.providers.utils.inference.prompt_adapter import (
+    interleaved_content_as_str,
+)
+from llama_stack.providers.utils.memory.vector_store import (
+    content_from_data_and_mime_type,
+    make_overlapped_chunks,
+)
+from llama_stack_api import (
+    DEFAULT_CHUNK_OVERLAP_TOKENS,
+    DEFAULT_CHUNK_SIZE_TOKENS,
+    MAX_PAGINATION_LIMIT,
     Chunk,
+    ChunkForDeletion,
+    DeleteChunksRequest,
+    EmbeddedChunk,
+    Files,
+    Inference,
+    InsertChunksRequest,
+    OpenAIAttachFileRequest,
     OpenAICreateVectorStoreFileBatchRequestWithExtraBody,
     OpenAICreateVectorStoreRequestWithExtraBody,
+    OpenAIEmbeddingsRequestWithExtraBody,
+    OpenAIFileObject,
+    OpenAISearchVectorStoreRequest,
+    OpenAIUpdateVectorStoreFileRequest,
+    OpenAIUpdateVectorStoreRequest,
+    QueryChunksRequest,
     QueryChunksResponse,
     SearchRankingOptions,
+    VectorStore,
     VectorStoreChunkingStrategy,
     VectorStoreChunkingStrategyAuto,
     VectorStoreChunkingStrategyStatic,
+    VectorStoreChunkingStrategyStaticConfig,
     VectorStoreContent,
     VectorStoreDeleteResponse,
     VectorStoreFileBatchObject,
-    VectorStoreFileContentsResponse,
+    VectorStoreFileContentResponse,
     VectorStoreFileCounts,
     VectorStoreFileDeleteResponse,
     VectorStoreFileLastError,
@@ -38,29 +63,22 @@ from llama_stack.apis.vector_io import (
     VectorStoreFileStatus,
     VectorStoreListFilesResponse,
     VectorStoreListResponse,
+    VectorStoreNotFoundError,
     VectorStoreObject,
     VectorStoreSearchResponse,
     VectorStoreSearchResponsePage,
 )
-from llama_stack.apis.vector_stores import VectorStore
-from llama_stack.core.id_generation import generate_object_id
-from llama_stack.log import get_logger
-from llama_stack.providers.utils.kvstore.api import KVStore
-from llama_stack.providers.utils.memory.vector_store import (
-    ChunkForDeletion,
-    content_from_data_and_mime_type,
-    make_overlapped_chunks,
+from llama_stack_api.files.models import (
+    RetrieveFileContentRequest,
+    RetrieveFileRequest,
 )
+from llama_stack_api.internal.kvstore import KVStore
 
 EMBEDDING_DIMENSION = 768
 
 logger = get_logger(name=__name__, category="providers::utils")
 
 # Constants for OpenAI vector stores
-CHUNK_MULTIPLIER = 5
-FILE_BATCH_CLEANUP_INTERVAL_SECONDS = 24 * 60 * 60  # 1 day in seconds
-MAX_CONCURRENT_FILES_PER_BATCH = 3  # Maximum concurrent file processing within a batch
-FILE_BATCH_CHUNK_SIZE = 10  # Process files in chunks of this size
 
 VERSION = "v3"
 VECTOR_DBS_PREFIX = f"vector_stores:{VERSION}::"
@@ -81,15 +99,29 @@ class OpenAIVectorStoreMixin(ABC):
     # to properly initialize the mixin attributes.
     def __init__(
         self,
+        inference_api: Inference,
         files_api: Files | None = None,
         kvstore: KVStore | None = None,
+        vector_stores_config: VectorStoresConfig | None = None,
     ):
+        if not inference_api:
+            raise RuntimeError("Inference API is required for vector store operations")
+
+        self.inference_api = inference_api
         self.openai_vector_stores: dict[str, dict[str, Any]] = {}
         self.openai_file_batches: dict[str, dict[str, Any]] = {}
         self.files_api = files_api
         self.kvstore = kvstore
+        self.vector_stores_config = vector_stores_config or VectorStoresConfig()
         self._last_file_batch_cleanup_time = 0
         self._file_batch_tasks: dict[str, asyncio.Task[None]] = {}
+        self._vector_store_locks: dict[str, asyncio.Lock] = {}
+
+    def _get_vector_store_lock(self, vector_store_id: str) -> asyncio.Lock:
+        """Get or create a lock for a specific vector store."""
+        if vector_store_id not in self._vector_store_locks:
+            self._vector_store_locks[vector_store_id] = asyncio.Lock()
+        return self._vector_store_locks[vector_store_id]
 
     async def _save_openai_vector_store(self, store_id: str, store_info: dict[str, Any]) -> None:
         """Save vector store metadata to persistent storage."""
@@ -98,6 +130,39 @@ class OpenAIVectorStoreMixin(ABC):
         await self.kvstore.set(key=key, value=json.dumps(store_info))
         # update in-memory cache
         self.openai_vector_stores[store_id] = store_info
+
+    async def _ensure_openai_metadata_exists(self, vector_store: VectorStore, name: str | None = None) -> None:
+        """
+        Ensure OpenAI-compatible metadata exists for a vector store.
+        """
+        if vector_store.identifier not in self.openai_vector_stores:
+            store_info = {
+                "id": vector_store.identifier,
+                "object": "vector_store",
+                "created_at": int(time.time()),
+                "name": name or vector_store.vector_store_name or vector_store.identifier,
+                "usage_bytes": 0,
+                "file_counts": VectorStoreFileCounts(
+                    cancelled=0,
+                    completed=0,
+                    failed=0,
+                    in_progress=0,
+                    total=0,
+                ).model_dump(),
+                "status": "completed",
+                "expires_after": None,
+                "expires_at": None,
+                "last_active_at": int(time.time()),
+                "file_ids": [],
+                "chunking_strategy": None,
+                "metadata": {
+                    "provider_id": vector_store.provider_id,
+                    "provider_vector_store_id": vector_store.provider_resource_id,
+                    "embedding_model": vector_store.embedding_model,
+                    "embedding_dimension": str(vector_store.embedding_dimension),
+                },
+            }
+            await self._save_openai_vector_store(vector_store.identifier, store_info)
 
     async def _load_openai_vector_stores(self) -> dict[str, dict[str, Any]]:
         """Load all vector store metadata from persistent storage."""
@@ -316,7 +381,7 @@ class OpenAIVectorStoreMixin(ABC):
                     pass
 
     @abstractmethod
-    async def delete_chunks(self, store_id: str, chunks_for_deletion: list[ChunkForDeletion]) -> None:
+    async def delete_chunks(self, request: DeleteChunksRequest) -> None:
         """Delete chunks from a vector store."""
         pass
 
@@ -333,16 +398,15 @@ class OpenAIVectorStoreMixin(ABC):
     @abstractmethod
     async def insert_chunks(
         self,
-        vector_store_id: str,
-        chunks: list[Chunk],
-        ttl_seconds: int | None = None,
+        request: InsertChunksRequest,
     ) -> None:
         """Insert chunks into a vector database (provider-specific implementation)."""
         pass
 
     @abstractmethod
     async def query_chunks(
-        self, vector_store_id: str, query: Any, params: dict[str, Any] | None = None
+        self,
+        request: QueryChunksRequest,
     ) -> QueryChunksResponse:
         """Query chunks from a vector database (provider-specific implementation)."""
         pass
@@ -414,6 +478,15 @@ class OpenAIVectorStoreMixin(ABC):
             in_progress=0,
             total=0,
         )
+        if not params.chunking_strategy or params.chunking_strategy.type == "auto":
+            chunking_strategy = VectorStoreChunkingStrategyStatic(
+                static=VectorStoreChunkingStrategyStaticConfig(
+                    max_chunk_size_tokens=DEFAULT_CHUNK_SIZE_TOKENS,
+                    chunk_overlap_tokens=DEFAULT_CHUNK_OVERLAP_TOKENS,
+                )
+            )
+        else:
+            chunking_strategy = params.chunking_strategy
         store_info: dict[str, Any] = {
             "id": vector_store_id,
             "object": "vector_store",
@@ -426,7 +499,7 @@ class OpenAIVectorStoreMixin(ABC):
             "expires_at": None,
             "last_active_at": created_at,
             "file_ids": [],
-            "chunking_strategy": params.chunking_strategy,
+            "chunking_strategy": chunking_strategy.model_dump(),
         }
 
         # Add provider information to metadata if provided
@@ -434,6 +507,11 @@ class OpenAIVectorStoreMixin(ABC):
             metadata["provider_id"] = provider_id
         if provider_vector_store_id:
             metadata["provider_vector_store_id"] = provider_vector_store_id
+
+        # Add embedding configuration to metadata for file processing
+        metadata["embedding_model"] = embedding_model
+        metadata["embedding_dimension"] = str(embedding_dimension)
+
         store_info["metadata"] = metadata
 
         # Save to persistent storage (provider-specific)
@@ -444,8 +522,17 @@ class OpenAIVectorStoreMixin(ABC):
 
         # Now that our vector store is created, attach any files that were provided
         file_ids = params.file_ids or []
-        tasks = [self.openai_attach_file_to_vector_store(vector_store_id, file_id) for file_id in file_ids]
-        await asyncio.gather(*tasks)
+        tasks = [
+            self.openai_attach_file_to_vector_store(vector_store_id, OpenAIAttachFileRequest(file_id=file_id))
+            for file_id in file_ids
+        ]
+        # Use return_exceptions=True to handle individual file attachment failures gracefully
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Log any exceptions but don't fail the vector store creation
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                logger.warning(f"Failed to attach file {file_ids[i]} to vector store {vector_store_id}: {result}")
 
         # Get the updated store info and return it
         store_info = self.openai_vector_stores[vector_store_id]
@@ -459,7 +546,7 @@ class OpenAIVectorStoreMixin(ABC):
         before: str | None = None,
     ) -> VectorStoreListResponse:
         """Returns a list of vector stores."""
-        limit = limit or 20
+        limit = min(limit or 20, MAX_PAGINATION_LIMIT)
         order = order or "desc"
 
         # Get all vector stores
@@ -513,9 +600,7 @@ class OpenAIVectorStoreMixin(ABC):
     async def openai_update_vector_store(
         self,
         vector_store_id: str,
-        name: str | None = None,
-        expires_after: dict[str, Any] | None = None,
-        metadata: dict[str, Any] | None = None,
+        request: OpenAIUpdateVectorStoreRequest,
     ) -> VectorStoreObject:
         """Modifies a vector store."""
         if vector_store_id not in self.openai_vector_stores:
@@ -524,12 +609,12 @@ class OpenAIVectorStoreMixin(ABC):
         store_info = self.openai_vector_stores[vector_store_id].copy()
 
         # Update fields if provided
-        if name is not None:
-            store_info["name"] = name
-        if expires_after is not None:
-            store_info["expires_after"] = expires_after
-        if metadata is not None:
-            store_info["metadata"] = metadata
+        if request.name is not None:
+            store_info["name"] = request.name
+        if request.expires_after is not None:
+            store_info["expires_after"] = request.expires_after
+        if request.metadata is not None:
+            store_info["metadata"] = request.metadata
 
         # Update last_active_at
         store_info["last_active_at"] = int(time.time())
@@ -570,57 +655,75 @@ class OpenAIVectorStoreMixin(ABC):
     async def openai_search_vector_store(
         self,
         vector_store_id: str,
-        query: str | list[str],
-        filters: dict[str, Any] | None = None,
-        max_num_results: int | None = 10,
-        ranking_options: SearchRankingOptions | None = None,
-        rewrite_query: bool | None = False,
-        search_mode: (
-            str | None
-        ) = "vector",  # Using str instead of Literal due to OpenAPI schema generator limitations
+        request: OpenAISearchVectorStoreRequest,
     ) -> VectorStoreSearchResponsePage:
-        """Search for chunks in a vector store."""
-        max_num_results = max_num_results or 10
+        """Search for chunks in a vector store.
+
+        Note: Query rewriting is handled at the router level, not here.
+        The rewrite_query parameter is kept for API compatibility but is ignored.
+        """
+        max_num_results = request.max_num_results or 10
 
         # Validate search_mode
         valid_modes = {"keyword", "vector", "hybrid"}
-        if search_mode not in valid_modes:
-            raise ValueError(f"search_mode must be one of {valid_modes}, got {search_mode}")
+        if request.search_mode not in valid_modes:
+            raise ValueError(f"search_mode must be one of {valid_modes}, got {request.search_mode}")
 
         if vector_store_id not in self.openai_vector_stores:
             raise VectorStoreNotFoundError(vector_store_id)
 
-        if isinstance(query, list):
-            search_query = " ".join(query)
+        if isinstance(request.query, list):
+            search_query = " ".join(request.query)
         else:
-            search_query = query
+            search_query = request.query
 
         try:
+            # Validate neural ranker requires model parameter
+            if request.ranking_options is not None:
+                if getattr(request.ranking_options, "ranker", None) == "neural":
+                    model_value = getattr(request.ranking_options, "model", None)
+                    if model_value is None or (isinstance(model_value, str) and model_value.strip() == ""):
+                        # Return empty results when model is missing for neural ranker
+                        logger.warning("model parameter is required when ranker='neural', returning empty results")
+                        return VectorStoreSearchResponsePage(
+                            search_query=request.query if isinstance(request.query, list) else [request.query],
+                            data=[],
+                            has_more=False,
+                            next_page=None,
+                        )
             score_threshold = (
-                ranking_options.score_threshold
-                if ranking_options and ranking_options.score_threshold is not None
+                request.ranking_options.score_threshold
+                if request.ranking_options and request.ranking_options.score_threshold is not None
                 else 0.0
             )
             params = {
-                "max_chunks": max_num_results * CHUNK_MULTIPLIER,
+                "max_chunks": max_num_results * self.vector_stores_config.chunk_retrieval_params.chunk_multiplier,
                 "score_threshold": score_threshold,
-                "mode": search_mode,
+                "mode": request.search_mode,
             }
-            # TODO: Add support for ranking_options.ranker
+
+            # Use VectorStoresConfig defaults when ranking_options values are not provided
+            config = self.vector_stores_config or VectorStoresConfig()
+            params.update(self._build_reranker_params(request.ranking_options, config))
 
             response = await self.query_chunks(
-                vector_store_id=vector_store_id,
-                query=search_query,
-                params=params,
+                QueryChunksRequest(
+                    vector_store_id=vector_store_id,
+                    query=search_query,
+                    params=params,
+                )
             )
 
             # Convert response to OpenAI format
             data = []
-            for chunk, score in zip(response.chunks, response.scores, strict=False):
+            for embedded_chunk, score in zip(response.chunks, response.scores, strict=False):
+                # EmbeddedChunk inherits from Chunk, so use it directly
+                chunk = embedded_chunk
+
                 # Apply filters if provided
-                if filters:
+                if request.filters:
                     # Simple metadata filtering
-                    if not self._matches_filters(chunk.metadata, filters):
+                    if not self._matches_filters(chunk.metadata, request.filters):
                         continue
 
                 content = self._chunk_to_vector_store_content(chunk)
@@ -637,21 +740,77 @@ class OpenAIVectorStoreMixin(ABC):
                     break
 
             return VectorStoreSearchResponsePage(
-                search_query=search_query,
+                search_query=request.query if isinstance(request.query, list) else [request.query],
                 data=data,
                 has_more=False,  # For simplicity, we don't implement pagination here
                 next_page=None,
             )
 
         except Exception as e:
+            # Log the error and return empty results
             logger.error(f"Error searching vector store {vector_store_id}: {e}")
-            # Return empty results on error
             return VectorStoreSearchResponsePage(
-                search_query=search_query,
+                search_query=request.query if isinstance(request.query, list) else [request.query],
                 data=[],
                 has_more=False,
                 next_page=None,
             )
+
+    def _build_reranker_params(
+        self,
+        ranking_options: SearchRankingOptions | None,
+        config: VectorStoresConfig,
+    ) -> dict[str, Any]:
+        reranker_params: dict[str, Any] = {}
+        params: dict[str, Any] = {}
+
+        if ranking_options and ranking_options.ranker:
+            reranker_type = ranking_options.ranker
+
+            if ranking_options.ranker == "weighted":
+                alpha = ranking_options.alpha
+                if alpha is None:
+                    alpha = config.chunk_retrieval_params.weighted_search_alpha
+                reranker_params["alpha"] = alpha
+                if ranking_options.weights:
+                    reranker_params["weights"] = ranking_options.weights
+            elif ranking_options.ranker == "rrf":
+                # For RRF ranker, use impact_factor from request if provided, otherwise use VectorStoresConfig default
+                impact_factor = ranking_options.impact_factor
+                if impact_factor is None:
+                    impact_factor = config.chunk_retrieval_params.rrf_impact_factor
+                reranker_params["impact_factor"] = impact_factor
+                # If weights dict is provided (for neural combination), store it
+                if ranking_options.weights:
+                    reranker_params["weights"] = ranking_options.weights
+            elif ranking_options.ranker == "neural":
+                reranker_params["model"] = ranking_options.model
+            else:
+                logger.debug(f"Unknown ranker value: {ranking_options.ranker}, passing through")
+
+            params["reranker_type"] = reranker_type
+            params["reranker_params"] = reranker_params
+
+            # Store model and weights for neural reranking (TODO: implemented in Part II)
+            if ranking_options.model:
+                params["neural_model"] = ranking_options.model
+            if ranking_options.weights:
+                params["neural_weights"] = ranking_options.weights
+        elif ranking_options is None or ranking_options.ranker is None:
+            # No ranker specified in request - use VectorStoresConfig default
+            default_strategy = config.chunk_retrieval_params.default_reranker_strategy
+            if default_strategy in ("weighted", "rrf"):
+                params["reranker_type"] = default_strategy
+                reranker_params = {}
+
+                if default_strategy == "weighted":
+                    reranker_params["alpha"] = config.chunk_retrieval_params.weighted_search_alpha
+                elif default_strategy == "rrf":
+                    reranker_params["impact_factor"] = config.chunk_retrieval_params.rrf_impact_factor
+
+                params["reranker_params"] = reranker_params
+
+        return params
 
     def _matches_filters(self, metadata: dict[str, Any], filters: dict[str, Any]) -> bool:
         """Check if metadata matches the provided filters."""
@@ -660,15 +819,29 @@ class OpenAIVectorStoreMixin(ABC):
 
         filter_type = filters.get("type")
 
+        if filter_type is None:
+            if "key" not in filters and "value" not in filters and "filters" not in filters:
+                for key, value in filters.items():
+                    if key not in metadata:
+                        return False
+                    if metadata[key] != value:
+                        return False
+                return True
+            else:
+                raise ValueError("Unsupported filter structure: missing 'type' field")
+
         if filter_type in ["eq", "ne", "gt", "gte", "lt", "lte"]:
             # Comparison filter
-            key = filters.get("key")
+            filter_key = filters.get("key")
             value = filters.get("value")
 
-            if key not in metadata:
+            if filter_key is None or not isinstance(filter_key, str):
                 return False
 
-            metadata_value = metadata[key]
+            if filter_key not in metadata:
+                return False
+
+            metadata_value = metadata[filter_key]
 
             if filter_type == "eq":
                 return bool(metadata_value == value)
@@ -699,43 +872,43 @@ class OpenAIVectorStoreMixin(ABC):
             # Unknown filter type, default to no match
             raise ValueError(f"Unsupported filter type: {filter_type}")
 
-    def _chunk_to_vector_store_content(self, chunk: Chunk) -> list[VectorStoreContent]:
-        # content is InterleavedContent
+    def _chunk_to_vector_store_content(
+        self, chunk: EmbeddedChunk, include_embeddings: bool = False, include_metadata: bool = False
+    ) -> list[VectorStoreContent]:
+        def extract_fields() -> dict:
+            """Extract metadata fields from chunk based on include flags."""
+            return {
+                "chunk_metadata": chunk.chunk_metadata if include_metadata else None,
+                "metadata": chunk.metadata if include_metadata else None,
+                "embedding": chunk.embedding if include_embeddings else None,
+            }
+
+        fields = extract_fields()
+
         if isinstance(chunk.content, str):
-            content = [
-                VectorStoreContent(
-                    type="text",
-                    text=chunk.content,
-                )
-            ]
+            content_item = VectorStoreContent(type="text", text=chunk.content, **fields)
+            content = [content_item]
         elif isinstance(chunk.content, list):
             # TODO: Add support for other types of content
-            content = [
-                VectorStoreContent(
-                    type="text",
-                    text=item.text,
-                )
-                for item in chunk.content
-                if item.type == "text"
-            ]
+            content = []
+            for item in chunk.content:
+                if item.type == "text":
+                    content_item = VectorStoreContent(type="text", text=item.text, **fields)
+                    content.append(content_item)
         else:
             if chunk.content.type != "text":
                 raise ValueError(f"Unsupported content type: {chunk.content.type}")
-            content = [
-                VectorStoreContent(
-                    type="text",
-                    text=chunk.content.text,
-                )
-            ]
+
+            content_item = VectorStoreContent(type="text", text=chunk.content.text, **fields)
+            content = [content_item]
         return content
 
     async def openai_attach_file_to_vector_store(
         self,
         vector_store_id: str,
-        file_id: str,
-        attributes: dict[str, Any] | None = None,
-        chunking_strategy: VectorStoreChunkingStrategy | None = None,
+        request: OpenAIAttachFileRequest,
     ) -> VectorStoreFileObject:
+        file_id = request.file_id
         if vector_store_id not in self.openai_vector_stores:
             raise VectorStoreNotFoundError(vector_store_id)
 
@@ -747,10 +920,11 @@ class OpenAIVectorStoreMixin(ABC):
             file_info = await self._load_openai_vector_store_file(vector_store_id, file_id)
             return VectorStoreFileObject(**file_info)
 
-        attributes = attributes or {}
-        chunking_strategy = chunking_strategy or VectorStoreChunkingStrategyAuto()
+        attributes = request.attributes or {}
+        chunking_strategy = request.chunking_strategy or VectorStoreChunkingStrategyAuto()
         created_at = int(time.time())
         chunks: list[Chunk] = []
+        embedded_chunks: list[EmbeddedChunk] = []
         file_response: OpenAIFileObject | None = None
 
         vector_store_file_object = VectorStoreFileObject(
@@ -775,18 +949,25 @@ class OpenAIVectorStoreMixin(ABC):
             chunk_overlap_tokens = chunking_strategy.static.chunk_overlap_tokens
         else:
             # Default values from OpenAI API spec
-            max_chunk_size_tokens = 800
-            chunk_overlap_tokens = 400
+            max_chunk_size_tokens = DEFAULT_CHUNK_SIZE_TOKENS
+            chunk_overlap_tokens = DEFAULT_CHUNK_OVERLAP_TOKENS
 
         try:
-            file_response = await self.files_api.openai_retrieve_file(file_id)
+            file_response = await self.files_api.openai_retrieve_file(RetrieveFileRequest(file_id=file_id))
             mime_type, _ = mimetypes.guess_type(file_response.filename)
-            content_response = await self.files_api.openai_retrieve_file_content(file_id)
+            content_response = await self.files_api.openai_retrieve_file_content(
+                RetrieveFileContentRequest(file_id=file_id)
+            )
 
-            content = content_from_data_and_mime_type(content_response.body, mime_type)
+            content = content_from_data_and_mime_type(bytes(content_response.body), mime_type)
 
             chunk_attributes = attributes.copy()
             chunk_attributes["filename"] = file_response.filename
+
+            # Get embedding model info from vector store metadata
+            store_info = self.openai_vector_stores[vector_store_id]
+            embedding_model = store_info["metadata"].get("embedding_model")
+            embedding_dimension = store_info["metadata"].get("embedding_dimension")
 
             chunks = make_overlapped_chunks(
                 file_id,
@@ -802,9 +983,45 @@ class OpenAIVectorStoreMixin(ABC):
                     message="No chunks were generated from the file",
                 )
             else:
+                # Validate embedding model and dimension are available
+                if not embedding_model:
+                    raise RuntimeError(f"Vector store {vector_store_id} is not properly configured for file processing")
+                if not embedding_dimension:
+                    raise RuntimeError(f"Vector store {vector_store_id} is not properly configured for file processing")
+
+                # Generate embeddings for all chunks before insertion
+
+                # Prepare embedding request for all chunks
+                params = OpenAIEmbeddingsRequestWithExtraBody(
+                    model=embedding_model,
+                    input=[interleaved_content_as_str(c.content) for c in chunks],
+                    dimensions=embedding_dimension,
+                )
+                resp = await self.inference_api.openai_embeddings(params)
+
+                # Create EmbeddedChunk instances from chunks and their embeddings
+                for chunk, data in zip(chunks, resp.data, strict=False):
+                    # Ensure embedding is a list of floats
+                    embedding = data.embedding
+                    if isinstance(embedding, str):
+                        # Handle case where embedding might be returned as a string (shouldn't normally happen)
+                        raise ValueError(f"Received string embedding instead of list: {embedding}")
+                    embedded_chunk = EmbeddedChunk(
+                        content=chunk.content,
+                        chunk_id=chunk.chunk_id,
+                        metadata=chunk.metadata,
+                        chunk_metadata=chunk.chunk_metadata,
+                        embedding=embedding,
+                        embedding_model=embedding_model,
+                        embedding_dimension=len(embedding),
+                    )
+                    embedded_chunks.append(embedded_chunk)
+
                 await self.insert_chunks(
-                    vector_store_id=vector_store_id,
-                    chunks=chunks,
+                    InsertChunksRequest(
+                        vector_store_id=vector_store_id,
+                        chunks=embedded_chunks,
+                    )
                 )
                 vector_store_file_object.status = "completed"
         except Exception as e:
@@ -815,26 +1032,27 @@ class OpenAIVectorStoreMixin(ABC):
                 message=str(e),
             )
 
-        # Create OpenAI vector store file metadata
+        # Save vector store file to persistent storage AFTER insert_chunks
+        # so that chunks include the embeddings that were generated
         file_info = vector_store_file_object.model_dump(exclude={"last_error"})
         file_info["filename"] = file_response.filename if file_response else ""
 
-        # Save vector store file to persistent storage (provider-specific)
-        dict_chunks = [c.model_dump() for c in chunks]
-        # This should be updated to include chunk_id
+        dict_chunks = [c.model_dump() for c in embedded_chunks]
         await self._save_openai_vector_store_file(vector_store_id, file_id, file_info, dict_chunks)
 
         # Update file_ids and file_counts in vector store metadata
-        store_info = self.openai_vector_stores[vector_store_id].copy()
-        store_info["file_ids"].append(file_id)
-        store_info["file_counts"]["total"] += 1
-        store_info["file_counts"][vector_store_file_object.status] += 1
+        # Use lock to prevent race condition when multiple files are attached concurrently
+        async with self._get_vector_store_lock(vector_store_id):
+            store_info = self.openai_vector_stores[vector_store_id].copy()
+            # Deep copy file_counts to avoid mutating shared dict
+            store_info["file_counts"] = store_info["file_counts"].copy()
+            store_info["file_ids"] = store_info["file_ids"].copy()
+            store_info["file_ids"].append(file_id)
+            store_info["file_counts"]["total"] += 1
+            store_info["file_counts"][vector_store_file_object.status] += 1
 
-        # Save updated vector store to persistent storage
-        await self._save_openai_vector_store(vector_store_id, store_info)
-
-        # Update vector store in-memory cache
-        self.openai_vector_stores[vector_store_id] = store_info
+            # Save updated vector store to persistent storage
+            await self._save_openai_vector_store(vector_store_id, store_info)
 
         return vector_store_file_object
 
@@ -848,7 +1066,7 @@ class OpenAIVectorStoreMixin(ABC):
         filter: VectorStoreFileStatus | None = None,
     ) -> VectorStoreListFilesResponse:
         """List files in a vector store."""
-        limit = limit or 20
+        limit = min(limit or 20, MAX_PAGINATION_LIMIT)
         order = order or "desc"
 
         if vector_store_id not in self.openai_vector_stores:
@@ -886,8 +1104,8 @@ class OpenAIVectorStoreMixin(ABC):
 
         # Determine pagination info
         has_more = len(file_objects) > limit
-        first_id = file_objects[0].id if file_objects else None
-        last_id = file_objects[-1].id if file_objects else None
+        first_id = limited_files[0].id if file_objects else None
+        last_id = limited_files[-1].id if file_objects else None
 
         return VectorStoreListFilesResponse(
             data=limited_files,
@@ -916,29 +1134,34 @@ class OpenAIVectorStoreMixin(ABC):
         self,
         vector_store_id: str,
         file_id: str,
-    ) -> VectorStoreFileContentsResponse:
+        include_embeddings: bool | None = False,
+        include_metadata: bool | None = False,
+    ) -> VectorStoreFileContentResponse:
         """Retrieves the contents of a vector store file."""
         if vector_store_id not in self.openai_vector_stores:
             raise VectorStoreNotFoundError(vector_store_id)
 
-        file_info = await self._load_openai_vector_store_file(vector_store_id, file_id)
+        # Parameters are already provided directly
+        # include_embeddings and include_metadata are now function parameters
+
         dict_chunks = await self._load_openai_vector_store_file_contents(vector_store_id, file_id)
-        chunks = [Chunk.model_validate(c) for c in dict_chunks]
+        chunks = [EmbeddedChunk.model_validate(c) for c in dict_chunks]
         content = []
         for chunk in chunks:
-            content.extend(self._chunk_to_vector_store_content(chunk))
-        return VectorStoreFileContentsResponse(
-            file_id=file_id,
-            filename=file_info.get("filename", ""),
-            attributes=file_info.get("attributes", {}),
-            content=content,
+            content.extend(
+                self._chunk_to_vector_store_content(
+                    chunk, include_embeddings=include_embeddings or False, include_metadata=include_metadata or False
+                )
+            )
+        return VectorStoreFileContentResponse(
+            data=content,
         )
 
     async def openai_update_vector_store_file(
         self,
         vector_store_id: str,
         file_id: str,
-        attributes: dict[str, Any],
+        request: OpenAIUpdateVectorStoreFileRequest,
     ) -> VectorStoreFileObject:
         """Updates a vector store file."""
         if vector_store_id not in self.openai_vector_stores:
@@ -949,7 +1172,7 @@ class OpenAIVectorStoreMixin(ABC):
             raise ValueError(f"File {file_id} not found in vector store {vector_store_id}")
 
         file_info = await self._load_openai_vector_store_file(vector_store_id, file_id)
-        file_info["attributes"] = attributes
+        file_info["attributes"] = request.attributes
         await self._update_openai_vector_store_file(vector_store_id, file_id, file_info)
         return VectorStoreFileObject(**file_info)
 
@@ -978,7 +1201,12 @@ class OpenAIVectorStoreMixin(ABC):
                     logger.warning(f"Chunk {c.chunk_id} has no document_id, skipping deletion")
 
         if chunks_for_deletion:
-            await self.delete_chunks(vector_store_id, chunks_for_deletion)
+            await self.delete_chunks(
+                DeleteChunksRequest(
+                    vector_store_id=vector_store_id,
+                    chunks=chunks_for_deletion,
+                )
+            )
 
         store_info = self.openai_vector_stores[vector_store_id].copy()
 
@@ -1048,7 +1276,10 @@ class OpenAIVectorStoreMixin(ABC):
 
         # Run cleanup if needed (throttled to once every 1 day)
         current_time = int(time.time())
-        if current_time - self._last_file_batch_cleanup_time >= FILE_BATCH_CLEANUP_INTERVAL_SECONDS:
+        if (
+            current_time - self._last_file_batch_cleanup_time
+            >= self.vector_stores_config.file_batch_params.cleanup_interval_seconds
+        ):
             logger.info("Running throttled cleanup of expired file batches")
             asyncio.create_task(self._cleanup_expired_file_batches())
             self._last_file_batch_cleanup_time = current_time
@@ -1065,7 +1296,7 @@ class OpenAIVectorStoreMixin(ABC):
         batch_info: dict[str, Any],
     ) -> None:
         """Process files with controlled concurrency and chunking."""
-        semaphore = asyncio.Semaphore(MAX_CONCURRENT_FILES_PER_BATCH)
+        semaphore = asyncio.Semaphore(self.vector_stores_config.file_batch_params.max_concurrent_files_per_batch)
 
         async def process_single_file(file_id: str) -> tuple[str, bool]:
             """Process a single file with concurrency control."""
@@ -1073,9 +1304,11 @@ class OpenAIVectorStoreMixin(ABC):
                 try:
                     vector_store_file_object = await self.openai_attach_file_to_vector_store(
                         vector_store_id=vector_store_id,
-                        file_id=file_id,
-                        attributes=attributes,
-                        chunking_strategy=chunking_strategy_obj,
+                        request=OpenAIAttachFileRequest(
+                            file_id=file_id,
+                            attributes=attributes,
+                            chunking_strategy=chunking_strategy_obj,
+                        ),
                     )
                     return file_id, vector_store_file_object.status == "completed"
                 except Exception as e:
@@ -1084,142 +1317,69 @@ class OpenAIVectorStoreMixin(ABC):
 
         # Process files in chunks to avoid creating too many tasks at once
         total_files = len(file_ids)
-        for chunk_start in range(0, total_files, FILE_BATCH_CHUNK_SIZE):
-            chunk_end = min(chunk_start + FILE_BATCH_CHUNK_SIZE, total_files)
-            chunk = file_ids[chunk_start:chunk_end]
+        chunk_size = self.vector_stores_config.file_batch_params.file_batch_chunk_size
 
-            chunk_num = chunk_start // FILE_BATCH_CHUNK_SIZE + 1
-            total_chunks = (total_files + FILE_BATCH_CHUNK_SIZE - 1) // FILE_BATCH_CHUNK_SIZE
-            logger.info(
-                f"Processing chunk {chunk_num} of {total_chunks} ({len(chunk)} files, {chunk_start + 1}-{chunk_end} of {total_files} total files)"
-            )
+        for i in range(0, total_files, chunk_size):
+            chunk_file_ids = file_ids[i : i + chunk_size]
+            tasks = [process_single_file(file_id) for file_id in chunk_file_ids]
 
-            async with asyncio.TaskGroup() as tg:
-                chunk_tasks = [tg.create_task(process_single_file(file_id)) for file_id in chunk]
+            # Wait for this chunk of files to complete
+            results = await asyncio.gather(*tasks)
 
-            chunk_results = [task.result() for task in chunk_tasks]
+            # Update batch info with results from this chunk
+            completed_files = sum(1 for _, success in results if success)
+            failed_files = sum(1 for _, success in results if not success)
 
-            # Update counts after each chunk for progressive feedback
-            for _, success in chunk_results:
-                self._update_file_counts(batch_info, success=success)
+            # Update batch info in storage
+            batch_info["file_counts"]["completed"] += completed_files
+            batch_info["file_counts"]["failed"] += failed_files
+            batch_info["file_counts"]["in_progress"] -= len(results)
 
-            # Save progress after each chunk
             await self._save_openai_vector_store_file_batch(batch_id, batch_info)
-
-    def _update_file_counts(self, batch_info: dict[str, Any], success: bool) -> None:
-        """Update file counts based on processing result."""
-        if success:
-            batch_info["file_counts"]["completed"] += 1
-        else:
-            batch_info["file_counts"]["failed"] += 1
-        batch_info["file_counts"]["in_progress"] -= 1
-
-    def _update_batch_status(self, batch_info: dict[str, Any]) -> None:
-        """Update final batch status based on file processing results."""
-        if batch_info["file_counts"]["failed"] == 0:
-            batch_info["status"] = "completed"
-        elif batch_info["file_counts"]["completed"] == 0:
-            batch_info["status"] = "failed"
-        else:
-            batch_info["status"] = "completed"  # Partial success counts as completed
 
     async def _process_file_batch_async(
-        self,
-        batch_id: str,
-        batch_info: dict[str, Any],
-        override_file_ids: list[str] | None = None,
+        self, batch_id: str, batch_info: dict[str, Any], file_ids_override: list[str] | None = None
     ) -> None:
-        """Process files in a batch asynchronously in the background."""
-        file_ids = override_file_ids if override_file_ids is not None else batch_info["file_ids"]
-        attributes = batch_info["attributes"]
-        chunking_strategy = batch_info["chunking_strategy"]
-        vector_store_id = batch_info["vector_store_id"]
-        chunking_strategy_adapter: TypeAdapter[VectorStoreChunkingStrategy] = TypeAdapter(VectorStoreChunkingStrategy)
-        chunking_strategy_obj = chunking_strategy_adapter.validate_python(chunking_strategy)
-
+        """Background task to process files in a batch."""
         try:
-            # Process all files with controlled concurrency
+            vector_store_id = batch_info["vector_store_id"]
+            file_ids = file_ids_override or batch_info["file_ids"]
+            attributes = batch_info.get("attributes") or {}
+            chunking_strategy_dict = batch_info.get("chunking_strategy")
+
+            # Reconstruct chunking strategy object
+            chunking_strategy_obj: VectorStoreChunkingStrategy | None = None
+            if chunking_strategy_dict:
+                if chunking_strategy_dict.get("type") == "static":
+                    chunking_strategy_obj = VectorStoreChunkingStrategyStatic(
+                        static=VectorStoreChunkingStrategyStaticConfig(**chunking_strategy_dict["static"])
+                    )
+                else:
+                    chunking_strategy_obj = VectorStoreChunkingStrategyAuto()
+
             await self._process_files_with_concurrency(
-                file_ids=file_ids,
-                vector_store_id=vector_store_id,
-                attributes=attributes,
-                chunking_strategy_obj=chunking_strategy_obj,
-                batch_id=batch_id,
-                batch_info=batch_info,
+                file_ids,
+                vector_store_id,
+                attributes,
+                chunking_strategy_obj,
+                batch_id,
+                batch_info,
             )
 
-            # Update final batch status
-            self._update_batch_status(batch_info)
+            # Mark batch as completed
+            batch_info["status"] = "completed"
+            batch_info["file_counts"]["in_progress"] = 0
             await self._save_openai_vector_store_file_batch(batch_id, batch_info)
 
-            logger.info(f"File batch {batch_id} processing completed with status: {batch_info['status']}")
-
         except asyncio.CancelledError:
-            logger.info(f"File batch {batch_id} processing was cancelled")
-            # Clean up task reference if it still exists
-            self._file_batch_tasks.pop(batch_id, None)
-            raise  # Re-raise to ensure proper cancellation propagation
-        finally:
-            # Always clean up task reference when processing ends
-            self._file_batch_tasks.pop(batch_id, None)
-
-    def _get_and_validate_batch(self, batch_id: str, vector_store_id: str) -> dict[str, Any]:
-        """Get and validate batch exists and belongs to vector store."""
-        if vector_store_id not in self.openai_vector_stores:
-            raise VectorStoreNotFoundError(vector_store_id)
-
-        if batch_id not in self.openai_file_batches:
-            raise ValueError(f"File batch {batch_id} not found")
-
-        batch_info = self.openai_file_batches[batch_id]
-
-        # Check if batch has expired (read-only check)
-        expires_at = batch_info.get("expires_at")
-        if expires_at:
-            current_time = int(time.time())
-            if current_time > expires_at:
-                raise ValueError(f"File batch {batch_id} has expired after 7 days from creation")
-
-        if batch_info["vector_store_id"] != vector_store_id:
-            raise ValueError(f"File batch {batch_id} does not belong to vector store {vector_store_id}")
-
-        return batch_info
-
-    def _paginate_objects(
-        self,
-        objects: list[Any],
-        limit: int | None = 20,
-        after: str | None = None,
-        before: str | None = None,
-    ) -> tuple[list[Any], bool, str | None, str | None]:
-        """Apply pagination to a list of objects with id fields."""
-        limit = min(limit or 20, 100)  # Cap at 100 as per OpenAI
-
-        # Find start index
-        start_idx = 0
-        if after:
-            for i, obj in enumerate(objects):
-                if obj.id == after:
-                    start_idx = i + 1
-                    break
-
-        # Find end index
-        end_idx = start_idx + limit
-        if before:
-            for i, obj in enumerate(objects[start_idx:], start_idx):
-                if obj.id == before:
-                    end_idx = i
-                    break
-
-        # Apply pagination
-        paginated_objects = objects[start_idx:end_idx]
-
-        # Determine pagination info
-        has_more = end_idx < len(objects)
-        first_id = paginated_objects[0].id if paginated_objects else None
-        last_id = paginated_objects[-1].id if paginated_objects else None
-
-        return paginated_objects, has_more, first_id, last_id
+            logger.info(f"File batch processing cancelled for batch {batch_id}")
+            batch_info["status"] = "cancelled"
+            await self._save_openai_vector_store_file_batch(batch_id, batch_info)
+            raise
+        except Exception:
+            logger.exception(f"Error processing file batch {batch_id}")
+            batch_info["status"] = "failed"
+            await self._save_openai_vector_store_file_batch(batch_id, batch_info)
 
     async def openai_retrieve_vector_store_file_batch(
         self,
@@ -1227,7 +1387,16 @@ class OpenAIVectorStoreMixin(ABC):
         vector_store_id: str,
     ) -> VectorStoreFileBatchObject:
         """Retrieve a vector store file batch."""
-        batch_info = self._get_and_validate_batch(batch_id, vector_store_id)
+        if vector_store_id not in self.openai_vector_stores:
+            raise VectorStoreNotFoundError(vector_store_id)
+
+        if batch_id not in self.openai_file_batches:
+            raise ValueError(f"File batch {batch_id} not found")
+
+        batch_info = self.openai_file_batches[batch_id]
+        if batch_info["vector_store_id"] != vector_store_id:
+            raise ValueError(f"File batch {batch_id} does not belong to vector store {vector_store_id}")
+
         return VectorStoreFileBatchObject(**batch_info)
 
     async def openai_list_files_in_vector_store_file_batch(
@@ -1241,38 +1410,69 @@ class OpenAIVectorStoreMixin(ABC):
         order: str | None = "desc",
     ) -> VectorStoreFilesListInBatchResponse:
         """Returns a list of vector store files in a batch."""
-        batch_info = self._get_and_validate_batch(batch_id, vector_store_id)
-        batch_file_ids = batch_info["file_ids"]
+        limit = min(limit or 20, MAX_PAGINATION_LIMIT)
+        order = order or "desc"
 
-        # Load file objects for files in this batch
-        batch_file_objects = []
+        if vector_store_id not in self.openai_vector_stores:
+            raise VectorStoreNotFoundError(vector_store_id)
 
-        for file_id in batch_file_ids:
+        if batch_id not in self.openai_file_batches:
+            raise ValueError(f"File batch {batch_id} not found")
+
+        batch_info = self.openai_file_batches[batch_id]
+        if batch_info["vector_store_id"] != vector_store_id:
+            raise ValueError(f"File batch {batch_id} does not belong to vector store {vector_store_id}")
+
+        file_ids = batch_info["file_ids"]
+        file_objects = []
+
+        # This could be slow for large batches if we load every file object.
+        # But we need to load them to filter/sort.
+        # Ideally we would store files per batch in a way that is efficiently queryable.
+        # For now, load them.
+        for file_id in file_ids:
             try:
                 file_info = await self._load_openai_vector_store_file(vector_store_id, file_id)
+                if not file_info:
+                    continue
                 file_object = VectorStoreFileObject(**file_info)
-
-                # Apply status filter if provided
                 if filter and file_object.status != filter:
                     continue
-
-                batch_file_objects.append(file_object)
-            except Exception as e:
-                logger.warning(f"Could not load file {file_id} from batch {batch_id}: {e}")
+                file_objects.append(file_object)
+            except Exception:
+                # File might have been deleted or failed to load
                 continue
 
         # Sort by created_at
         reverse_order = order == "desc"
-        batch_file_objects.sort(key=lambda x: x.created_at, reverse=reverse_order)
+        file_objects.sort(key=lambda x: x.created_at, reverse=reverse_order)
 
-        # Apply pagination using helper
-        paginated_files, has_more, first_id, last_id = self._paginate_objects(batch_file_objects, limit, after, before)
+        # Apply cursor-based pagination
+        if after:
+            after_index = next((i for i, file in enumerate(file_objects) if file.id == after), -1)
+            if after_index >= 0:
+                file_objects = file_objects[after_index + 1 :]
+
+        if before:
+            before_index = next(
+                (i for i, file in enumerate(file_objects) if file.id == before),
+                len(file_objects),
+            )
+            file_objects = file_objects[:before_index]
+
+        # Apply limit
+        limited_files = file_objects[:limit]
+
+        # Determine pagination info
+        has_more = len(file_objects) > limit
+        first_id = limited_files[0].id if limited_files else None
+        last_id = limited_files[-1].id if limited_files else None
 
         return VectorStoreFilesListInBatchResponse(
-            data=paginated_files,
+            data=limited_files,
+            has_more=has_more,
             first_id=first_id,
             last_id=last_id,
-            has_more=has_more,
         )
 
     async def openai_cancel_vector_store_file_batch(
@@ -1280,25 +1480,32 @@ class OpenAIVectorStoreMixin(ABC):
         batch_id: str,
         vector_store_id: str,
     ) -> VectorStoreFileBatchObject:
-        """Cancel a vector store file batch."""
-        batch_info = self._get_and_validate_batch(batch_id, vector_store_id)
+        """Cancels a vector store file batch."""
+        if vector_store_id not in self.openai_vector_stores:
+            raise VectorStoreNotFoundError(vector_store_id)
 
-        if batch_info["status"] not in ["in_progress"]:
-            raise ValueError(f"Cannot cancel batch {batch_id} with status {batch_info['status']}")
+        if batch_id not in self.openai_file_batches:
+            raise ValueError(f"File batch {batch_id} not found")
 
-        # Cancel the actual processing task if it exists
+        batch_info = self.openai_file_batches[batch_id]
+        if batch_info["vector_store_id"] != vector_store_id:
+            raise ValueError(f"File batch {batch_id} does not belong to vector store {vector_store_id}")
+
+        if batch_info["status"] == "completed":
+            return VectorStoreFileBatchObject(**batch_info)
+
+        # Cancel the background task if running
         if batch_id in self._file_batch_tasks:
             task = self._file_batch_tasks[batch_id]
             if not task.done():
                 task.cancel()
-                logger.info(f"Cancelled processing task for file batch: {batch_id}")
-            # Remove from task tracking
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
             del self._file_batch_tasks[batch_id]
 
         batch_info["status"] = "cancelled"
-
         await self._save_openai_vector_store_file_batch(batch_id, batch_info)
 
-        updated_batch = VectorStoreFileBatchObject(**batch_info)
-
-        return updated_batch
+        return VectorStoreFileBatchObject(**batch_info)

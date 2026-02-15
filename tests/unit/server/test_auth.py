@@ -21,8 +21,7 @@ from llama_stack.core.datatypes import (
     OAuth2JWKSConfig,
     OAuth2TokenAuthConfig,
 )
-from llama_stack.core.request_headers import User
-from llama_stack.core.server.auth import AuthenticationMiddleware, _has_required_scope
+from llama_stack.core.server.auth import AuthenticationMiddleware
 from llama_stack.core.server.auth_providers import (
     get_attributes_from_claims,
 )
@@ -143,11 +142,10 @@ def middleware_with_mocks(mock_auth_endpoint):
     )
     middleware = AuthenticationMiddleware(mock_app, auth_config, {})
 
-    # Mock the route_impls to simulate finding routes with required scopes
-    from llama_stack.schema_utils import WebMethod
+    from llama_stack_api import WebMethod
 
     routes = {
-        ("POST", "/test/scoped"): WebMethod(route="/test/scoped", method="POST", required_scope="test.read"),
+        ("POST", "/test/scoped"): WebMethod(route="/test/scoped", method="POST"),
         ("GET", "/test/public"): WebMethod(route="/test/public", method="GET"),
         ("GET", "/health"): WebMethod(route="/health", method="GET", require_authentication=False),
         ("GET", "/version"): WebMethod(route="/version", method="GET", require_authentication=False),
@@ -191,36 +189,6 @@ async def mock_post_failure(*args, **kwargs):
 
 async def mock_post_exception(*args, **kwargs):
     raise Exception("Connection error")
-
-
-async def mock_post_success_with_scope(*args, **kwargs):
-    """Mock auth response for user with test.read scope"""
-    return MockResponse(
-        200,
-        {
-            "message": "Authentication successful",
-            "principal": "test-user",
-            "attributes": {
-                "scopes": ["test.read", "other.scope"],
-                "roles": ["user"],
-            },
-        },
-    )
-
-
-async def mock_post_success_no_scope(*args, **kwargs):
-    """Mock auth response for user without required scope"""
-    return MockResponse(
-        200,
-        {
-            "message": "Authentication successful",
-            "principal": "test-user",
-            "attributes": {
-                "scopes": ["other.scope"],
-                "roles": ["user"],
-            },
-        },
-    )
 
 
 # HTTP Endpoint Tests
@@ -364,23 +332,6 @@ def test_invalid_auth_header_format_oauth2(oauth2_client):
     assert "Invalid Authorization header format" in response.json()["error"]["message"]
 
 
-async def mock_jwks_response(*args, **kwargs):
-    return MockResponse(
-        200,
-        {
-            "keys": [
-                {
-                    "kid": "1234567890",
-                    "kty": "oct",
-                    "alg": "HS256",
-                    "use": "sig",
-                    "k": base64.b64encode(b"foobarbaz").decode(),
-                }
-            ]
-        },
-    )
-
-
 @pytest.fixture
 def jwt_token_valid():
     import jwt
@@ -421,26 +372,58 @@ def mock_jwks_urlopen():
         yield mock_urlopen
 
 
+@pytest.fixture
+def mock_jwks_urlopen_with_auth_required():
+    """Mock urllib.request.urlopen that requires Bearer token for JWKS requests."""
+    with patch("urllib.request.urlopen") as mock_urlopen:
+
+        def side_effect(request, **kwargs):
+            # Check if Authorization header is present
+            auth_header = request.headers.get("Authorization") if hasattr(request, "headers") else None
+
+            if not auth_header or not auth_header.startswith("Bearer "):
+                # Simulate 401 Unauthorized
+                import urllib.error
+
+                raise urllib.error.HTTPError(
+                    url=request.full_url if hasattr(request, "full_url") else "",
+                    code=401,
+                    msg="Unauthorized",
+                    hdrs={},
+                    fp=None,
+                )
+
+            # Mock the JWKS response for PyJWKClient
+            mock_response = Mock()
+            mock_response.read.return_value = json.dumps(
+                {
+                    "keys": [
+                        {
+                            "kid": "1234567890",
+                            "kty": "oct",
+                            "alg": "HS256",
+                            "use": "sig",
+                            "k": base64.b64encode(b"foobarbaz").decode(),
+                        }
+                    ]
+                }
+            ).encode()
+            return mock_response
+
+        mock_urlopen.side_effect = side_effect
+        yield mock_urlopen
+
+
 def test_valid_oauth2_authentication(oauth2_client, jwt_token_valid, mock_jwks_urlopen):
     response = oauth2_client.get("/test", headers={"Authorization": f"Bearer {jwt_token_valid}"})
     assert response.status_code == 200
     assert response.json() == {"message": "Authentication successful"}
 
 
-@patch("httpx.AsyncClient.get", new=mock_jwks_response)
-def test_invalid_oauth2_authentication(oauth2_client, invalid_token, suppress_auth_errors):
+def test_invalid_oauth2_authentication(oauth2_client, invalid_token, mock_jwks_urlopen, suppress_auth_errors):
     response = oauth2_client.get("/test", headers={"Authorization": f"Bearer {invalid_token}"})
     assert response.status_code == 401
     assert "Invalid JWT token" in response.json()["error"]["message"]
-
-
-async def mock_auth_jwks_response(*args, **kwargs):
-    if "headers" not in kwargs or "Authorization" not in kwargs["headers"]:
-        return MockResponse(401, {})
-    authz = kwargs["headers"]["Authorization"]
-    if authz != "Bearer my-jwks-token":
-        return MockResponse(401, {})
-    return await mock_jwks_response(args, kwargs)
 
 
 @pytest.fixture
@@ -472,8 +455,9 @@ def oauth2_client_with_jwks_token(oauth2_app_with_jwks_token):
     return TestClient(oauth2_app_with_jwks_token)
 
 
-@patch("httpx.AsyncClient.get", new=mock_auth_jwks_response)
-def test_oauth2_with_jwks_token_expected(oauth2_client, jwt_token_valid, suppress_auth_errors):
+def test_oauth2_with_jwks_token_expected(
+    oauth2_client, jwt_token_valid, mock_jwks_urlopen_with_auth_required, suppress_auth_errors
+):
     response = oauth2_client.get("/test", headers={"Authorization": f"Bearer {jwt_token_valid}"})
     assert response.status_code == 401
 
@@ -763,125 +747,6 @@ def test_valid_introspection_with_custom_mapping_authentication(
     )
     assert response.status_code == 200
     assert response.json() == {"message": "Authentication successful"}
-
-
-# Scope-based authorization tests
-@patch("httpx.AsyncClient.post", new=mock_post_success_with_scope)
-async def test_scope_authorization_success(middleware_with_mocks, valid_api_key):
-    """Test that user with required scope can access protected endpoint"""
-    middleware, mock_app = middleware_with_mocks
-    mock_receive = AsyncMock()
-    mock_send = AsyncMock()
-
-    scope = {
-        "type": "http",
-        "path": "/test/scoped",
-        "method": "POST",
-        "headers": [(b"authorization", f"Bearer {valid_api_key}".encode())],
-    }
-
-    await middleware(scope, mock_receive, mock_send)
-
-    # Should call the downstream app (no 403 error sent)
-    mock_app.assert_called_once_with(scope, mock_receive, mock_send)
-    mock_send.assert_not_called()
-
-
-@patch("httpx.AsyncClient.post", new=mock_post_success_no_scope)
-async def test_scope_authorization_denied(middleware_with_mocks, valid_api_key):
-    """Test that user without required scope gets 403 access denied"""
-    middleware, mock_app = middleware_with_mocks
-    mock_receive = AsyncMock()
-    mock_send = AsyncMock()
-
-    scope = {
-        "type": "http",
-        "path": "/test/scoped",
-        "method": "POST",
-        "headers": [(b"authorization", f"Bearer {valid_api_key}".encode())],
-    }
-
-    await middleware(scope, mock_receive, mock_send)
-
-    # Should send 403 error, not call downstream app
-    mock_app.assert_not_called()
-    assert mock_send.call_count == 2  # start + body
-
-    # Check the response
-    start_call = mock_send.call_args_list[0][0][0]
-    assert start_call["status"] == 403
-
-    body_call = mock_send.call_args_list[1][0][0]
-    body_text = body_call["body"].decode()
-    assert "Access denied" in body_text
-    assert "test.read" in body_text
-
-
-@patch("httpx.AsyncClient.post", new=mock_post_success_no_scope)
-async def test_public_endpoint_no_scope_required(middleware_with_mocks, valid_api_key):
-    """Test that public endpoints work without specific scopes"""
-    middleware, mock_app = middleware_with_mocks
-    mock_receive = AsyncMock()
-    mock_send = AsyncMock()
-
-    scope = {
-        "type": "http",
-        "path": "/test/public",
-        "method": "GET",
-        "headers": [(b"authorization", f"Bearer {valid_api_key}".encode())],
-    }
-
-    await middleware(scope, mock_receive, mock_send)
-
-    # Should call the downstream app (no error)
-    mock_app.assert_called_once_with(scope, mock_receive, mock_send)
-    mock_send.assert_not_called()
-
-
-async def test_scope_authorization_no_auth_disabled(middleware_with_mocks):
-    """Test that when auth is disabled (no user), scope checks are bypassed"""
-    middleware, mock_app = middleware_with_mocks
-    mock_receive = AsyncMock()
-    mock_send = AsyncMock()
-
-    scope = {
-        "type": "http",
-        "path": "/test/scoped",
-        "method": "POST",
-        "headers": [],  # No authorization header
-    }
-
-    await middleware(scope, mock_receive, mock_send)
-
-    # Should send 401 auth error, not call downstream app
-    mock_app.assert_not_called()
-    assert mock_send.call_count == 2  # start + body
-
-    # Check the response
-    start_call = mock_send.call_args_list[0][0][0]
-    assert start_call["status"] == 401
-
-    body_call = mock_send.call_args_list[1][0][0]
-    body_text = body_call["body"].decode()
-    assert "Authentication required" in body_text
-
-
-def test_has_required_scope_function():
-    """Test the _has_required_scope function directly"""
-    # Test user with required scope
-    user_with_scope = User(principal="test-user", attributes={"scopes": ["test.read", "other.scope"]})
-    assert _has_required_scope("test.read", user_with_scope)
-
-    # Test user without required scope
-    user_without_scope = User(principal="test-user", attributes={"scopes": ["other.scope"]})
-    assert not _has_required_scope("test.read", user_without_scope)
-
-    # Test user with no scopes attribute
-    user_no_scopes = User(principal="test-user", attributes={})
-    assert not _has_required_scope("test.read", user_no_scopes)
-
-    # Test no user (auth disabled)
-    assert _has_required_scope("test.read", None)
 
 
 @pytest.fixture

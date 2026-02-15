@@ -12,25 +12,32 @@ from numpy.typing import NDArray
 from weaviate.classes.init import Auth
 from weaviate.classes.query import Filter, HybridFusion
 
-from llama_stack.apis.common.content_types import InterleavedContent
-from llama_stack.apis.common.errors import VectorStoreNotFoundError
-from llama_stack.apis.files import Files
-from llama_stack.apis.inference import Inference
-from llama_stack.apis.vector_io import Chunk, QueryChunksResponse, VectorIO
-from llama_stack.apis.vector_stores import VectorStore
 from llama_stack.core.request_headers import NeedsRequestProviderData
+from llama_stack.core.storage.kvstore import kvstore_impl
 from llama_stack.log import get_logger
-from llama_stack.providers.datatypes import VectorStoresProtocolPrivate
-from llama_stack.providers.utils.kvstore import kvstore_impl
-from llama_stack.providers.utils.kvstore.api import KVStore
 from llama_stack.providers.utils.memory.openai_vector_store_mixin import OpenAIVectorStoreMixin
 from llama_stack.providers.utils.memory.vector_store import (
     RERANKER_TYPE_RRF,
-    ChunkForDeletion,
     EmbeddingIndex,
     VectorStoreWithIndex,
 )
+from llama_stack.providers.utils.vector_io import load_embedded_chunk_with_backward_compat
 from llama_stack.providers.utils.vector_io.vector_utils import sanitize_collection_name
+from llama_stack_api import (
+    ChunkForDeletion,
+    DeleteChunksRequest,
+    EmbeddedChunk,
+    Files,
+    Inference,
+    InsertChunksRequest,
+    QueryChunksRequest,
+    QueryChunksResponse,
+    VectorIO,
+    VectorStore,
+    VectorStoreNotFoundError,
+    VectorStoresProtocolPrivate,
+)
+from llama_stack_api.internal.kvstore import KVStore
 
 from .config import WeaviateVectorIOConfig
 
@@ -53,20 +60,19 @@ class WeaviateIndex(EmbeddingIndex):
     async def initialize(self):
         pass
 
-    async def add_chunks(self, chunks: list[Chunk], embeddings: NDArray):
-        assert len(chunks) == len(embeddings), (
-            f"Chunk length {len(chunks)} does not match embedding length {len(embeddings)}"
-        )
+    async def add_chunks(self, chunks: list[EmbeddedChunk]):
+        if not chunks:
+            return
 
         data_objects = []
-        for chunk, embedding in zip(chunks, embeddings, strict=False):
+        for chunk in chunks:
             data_objects.append(
                 wvc.data.DataObject(
                     properties={
                         "chunk_id": chunk.chunk_id,
                         "chunk_content": chunk.model_dump_json(),
                     },
-                    vector=embedding.tolist(),
+                    vector=chunk.embedding,  # Already a list[float]
                 )
             )
 
@@ -112,7 +118,7 @@ class WeaviateIndex(EmbeddingIndex):
             chunk_json = doc.properties["chunk_content"]
             try:
                 chunk_dict = json.loads(chunk_json)
-                chunk = Chunk(**chunk_dict)
+                chunk = load_embedded_chunk_with_backward_compat(chunk_dict)
             except Exception:
                 log.exception(f"Failed to parse document: {chunk_json}")
                 continue
@@ -172,7 +178,7 @@ class WeaviateIndex(EmbeddingIndex):
             chunk_json = doc.properties["chunk_content"]
             try:
                 chunk_dict = json.loads(chunk_json)
-                chunk = Chunk(**chunk_dict)
+                chunk = load_embedded_chunk_with_backward_compat(chunk_dict)
             except Exception:
                 log.exception(f"Failed to parse document: {chunk_json}")
                 continue
@@ -241,7 +247,7 @@ class WeaviateIndex(EmbeddingIndex):
             chunk_json = doc.properties["chunk_content"]
             try:
                 chunk_dict = json.loads(chunk_json)
-                chunk = Chunk(**chunk_dict)
+                chunk = load_embedded_chunk_with_backward_compat(chunk_dict)
             except Exception:
                 log.exception(f"Failed to parse document: {chunk_json}")
                 continue
@@ -259,9 +265,8 @@ class WeaviateIndex(EmbeddingIndex):
 
 class WeaviateVectorIOAdapter(OpenAIVectorStoreMixin, VectorIO, NeedsRequestProviderData, VectorStoresProtocolPrivate):
     def __init__(self, config: WeaviateVectorIOConfig, inference_api: Inference, files_api: Files | None) -> None:
-        super().__init__(files_api=files_api, kvstore=None)
+        super().__init__(inference_api=inference_api, files_api=files_api, kvstore=None)
         self.config = config
-        self.inference_api = inference_api
         self.client_cache = {}
         self.cache = {}
         self.vector_store_table = None
@@ -346,13 +351,16 @@ class WeaviateVectorIOAdapter(OpenAIVectorStoreMixin, VectorIO, NeedsRequestProv
         if vector_store_id in self.cache:
             return self.cache[vector_store_id]
 
-        if self.vector_store_table is None:
+        # Try to load from kvstore
+        if self.kvstore is None:
+            raise RuntimeError("KVStore not initialized. Call initialize() before using vector stores.")
+
+        key = f"{VECTOR_DBS_PREFIX}{vector_store_id}"
+        vector_store_data = await self.kvstore.get(key)
+        if not vector_store_data:
             raise VectorStoreNotFoundError(vector_store_id)
 
-        vector_store = await self.vector_store_table.get_vector_store(vector_store_id)
-        if not vector_store:
-            raise VectorStoreNotFoundError(vector_store_id)
-
+        vector_store = VectorStore.model_validate_json(vector_store_data)
         client = self._get_client()
         sanitized_collection_name = sanitize_collection_name(vector_store.identifier, weaviate_format=True)
         if not client.collections.exists(sanitized_collection_name):
@@ -366,25 +374,23 @@ class WeaviateVectorIOAdapter(OpenAIVectorStoreMixin, VectorIO, NeedsRequestProv
         self.cache[vector_store_id] = index
         return index
 
-    async def insert_chunks(self, vector_store_id: str, chunks: list[Chunk], ttl_seconds: int | None = None) -> None:
-        index = await self._get_and_cache_vector_store_index(vector_store_id)
+    async def insert_chunks(self, request: InsertChunksRequest) -> None:
+        index = await self._get_and_cache_vector_store_index(request.vector_store_id)
         if not index:
-            raise VectorStoreNotFoundError(vector_store_id)
+            raise VectorStoreNotFoundError(request.vector_store_id)
 
-        await index.insert_chunks(chunks)
+        await index.insert_chunks(request)
 
-    async def query_chunks(
-        self, vector_store_id: str, query: InterleavedContent, params: dict[str, Any] | None = None
-    ) -> QueryChunksResponse:
-        index = await self._get_and_cache_vector_store_index(vector_store_id)
+    async def query_chunks(self, request: QueryChunksRequest) -> QueryChunksResponse:
+        index = await self._get_and_cache_vector_store_index(request.vector_store_id)
         if not index:
-            raise VectorStoreNotFoundError(vector_store_id)
+            raise VectorStoreNotFoundError(request.vector_store_id)
 
-        return await index.query_chunks(query, params)
+        return await index.query_chunks(request)
 
-    async def delete_chunks(self, store_id: str, chunks_for_deletion: list[ChunkForDeletion]) -> None:
-        index = await self._get_and_cache_vector_store_index(store_id)
+    async def delete_chunks(self, request: DeleteChunksRequest) -> None:
+        index = await self._get_and_cache_vector_store_index(request.vector_store_id)
         if not index:
-            raise ValueError(f"Vector DB {store_id} not found")
+            raise ValueError(f"Vector DB {request.vector_store_id} not found")
 
-        await index.index.delete_chunks(chunks_for_deletion)
+        await index.index.delete_chunks(request.chunks)

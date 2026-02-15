@@ -14,17 +14,28 @@ import faiss  # type: ignore[import-untyped]
 import numpy as np
 from numpy.typing import NDArray
 
-from llama_stack.apis.common.errors import VectorStoreNotFoundError
-from llama_stack.apis.files import Files
-from llama_stack.apis.inference import Inference, InterleavedContent
-from llama_stack.apis.vector_io import Chunk, QueryChunksResponse, VectorIO
-from llama_stack.apis.vector_stores import VectorStore
+from llama_stack.core.storage.kvstore import kvstore_impl
 from llama_stack.log import get_logger
-from llama_stack.providers.datatypes import HealthResponse, HealthStatus, VectorStoresProtocolPrivate
-from llama_stack.providers.utils.kvstore import kvstore_impl
-from llama_stack.providers.utils.kvstore.api import KVStore
 from llama_stack.providers.utils.memory.openai_vector_store_mixin import OpenAIVectorStoreMixin
-from llama_stack.providers.utils.memory.vector_store import ChunkForDeletion, EmbeddingIndex, VectorStoreWithIndex
+from llama_stack.providers.utils.memory.vector_store import EmbeddingIndex, VectorStoreWithIndex
+from llama_stack.providers.utils.vector_io import load_embedded_chunk_with_backward_compat
+from llama_stack_api import (
+    ChunkForDeletion,
+    DeleteChunksRequest,
+    EmbeddedChunk,
+    Files,
+    HealthResponse,
+    HealthStatus,
+    Inference,
+    InsertChunksRequest,
+    QueryChunksRequest,
+    QueryChunksResponse,
+    VectorIO,
+    VectorStore,
+    VectorStoreNotFoundError,
+    VectorStoresProtocolPrivate,
+)
+from llama_stack_api.internal.kvstore import KVStore
 
 from .config import FaissVectorIOConfig
 
@@ -41,7 +52,7 @@ OPENAI_VECTOR_STORES_FILES_CONTENTS_PREFIX = f"openai_vector_stores_files_conten
 class FaissIndex(EmbeddingIndex):
     def __init__(self, dimension: int, kvstore: KVStore | None = None, bank_id: str | None = None):
         self.index = faiss.IndexFlatL2(dimension)
-        self.chunk_by_index: dict[int, Chunk] = {}
+        self.chunk_by_index: dict[int, EmbeddedChunk] = {}
         self.kvstore = kvstore
         self.bank_id = bank_id
 
@@ -65,12 +76,16 @@ class FaissIndex(EmbeddingIndex):
 
         if stored_data:
             data = json.loads(stored_data)
-            self.chunk_by_index = {int(k): Chunk.model_validate_json(v) for k, v in data["chunk_by_index"].items()}
+            self.chunk_by_index = {}
+            for k, v in data["chunk_by_index"].items():
+                chunk_data = json.loads(v)
+                # Use generic backward compatibility utility
+                self.chunk_by_index[int(k)] = load_embedded_chunk_with_backward_compat(chunk_data)
 
             buffer = io.BytesIO(base64.b64decode(data["faiss_index"]))
             try:
                 self.index = faiss.deserialize_index(np.load(buffer, allow_pickle=False))
-                self.chunk_ids = [chunk.chunk_id for chunk in self.chunk_by_index.values()]
+                self.chunk_ids = [embedded_chunk.chunk_id for embedded_chunk in self.chunk_by_index.values()]
             except Exception as e:
                 logger.debug(e, exc_info=True)
                 raise ValueError(
@@ -100,19 +115,24 @@ class FaissIndex(EmbeddingIndex):
 
         await self.kvstore.delete(f"{FAISS_INDEX_PREFIX}{self.bank_id}")
 
-    async def add_chunks(self, chunks: list[Chunk], embeddings: NDArray):
-        # Add dimension check
+    async def add_chunks(self, embedded_chunks: list[EmbeddedChunk]):
+        if not embedded_chunks:
+            return
+
+        # Extract embeddings and validate dimensions
+        embeddings = np.array([ec.embedding for ec in embedded_chunks], dtype=np.float32)
         embedding_dim = embeddings.shape[1] if len(embeddings.shape) > 1 else embeddings.shape[0]
         if embedding_dim != self.index.d:
             raise ValueError(f"Embedding dimension mismatch. Expected {self.index.d}, got {embedding_dim}")
 
+        # Store chunks by index
         indexlen = len(self.chunk_by_index)
-        for i, chunk in enumerate(chunks):
-            self.chunk_by_index[indexlen + i] = chunk
+        for i, embedded_chunk in enumerate(embedded_chunks):
+            self.chunk_by_index[indexlen + i] = embedded_chunk
 
         async with self.chunk_id_lock:
-            self.index.add(np.array(embeddings).astype(np.float32))
-            self.chunk_ids.extend([chunk.chunk_id for chunk in chunks])
+            self.index.add(embeddings)
+            self.chunk_ids.extend([ec.chunk_id for ec in embedded_chunks])  # EmbeddedChunk inherits from Chunk
 
         # Save updated index
         await self._save_index()
@@ -144,8 +164,8 @@ class FaissIndex(EmbeddingIndex):
 
     async def query_vector(self, embedding: NDArray, k: int, score_threshold: float) -> QueryChunksResponse:
         distances, indices = await asyncio.to_thread(self.index.search, embedding.reshape(1, -1).astype(np.float32), k)
-        chunks = []
-        scores = []
+        chunks: list[EmbeddedChunk] = []
+        scores: list[float] = []
         for d, i in zip(distances[0], indices[0], strict=False):
             if i < 0:
                 continue
@@ -178,9 +198,8 @@ class FaissIndex(EmbeddingIndex):
 
 class FaissVectorIOAdapter(OpenAIVectorStoreMixin, VectorIO, VectorStoresProtocolPrivate):
     def __init__(self, config: FaissVectorIOConfig, inference_api: Inference, files_api: Files | None) -> None:
-        super().__init__(files_api=files_api, kvstore=None)
+        super().__init__(inference_api=inference_api, files_api=files_api, kvstore=None)
         self.config = config
-        self.inference_api = inference_api
         self.cache: dict[str, VectorStoreWithIndex] = {}
 
     async def initialize(self) -> None:
@@ -223,7 +242,8 @@ class FaissVectorIOAdapter(OpenAIVectorStoreMixin, VectorIO, VectorStoresProtoco
             return HealthResponse(status=HealthStatus.ERROR, message=f"Health check failed: {str(e)}")
 
     async def register_vector_store(self, vector_store: VectorStore) -> None:
-        assert self.kvstore is not None
+        if self.kvstore is None:
+            raise RuntimeError("KVStore not initialized. Call initialize() before registering vector stores.")
 
         key = f"{VECTOR_DBS_PREFIX}{vector_store.identifier}"
         await self.kvstore.set(key=key, value=vector_store.model_dump_json())
@@ -239,7 +259,8 @@ class FaissVectorIOAdapter(OpenAIVectorStoreMixin, VectorIO, VectorStoresProtoco
         return [i.vector_store for i in self.cache.values()]
 
     async def unregister_vector_store(self, vector_store_id: str) -> None:
-        assert self.kvstore is not None
+        if self.kvstore is None:
+            raise RuntimeError("KVStore not initialized. Call initialize() before unregistering vector stores.")
 
         if vector_store_id not in self.cache:
             return
@@ -248,23 +269,42 @@ class FaissVectorIOAdapter(OpenAIVectorStoreMixin, VectorIO, VectorStoresProtoco
         del self.cache[vector_store_id]
         await self.kvstore.delete(f"{VECTOR_DBS_PREFIX}{vector_store_id}")
 
-    async def insert_chunks(self, vector_store_id: str, chunks: list[Chunk], ttl_seconds: int | None = None) -> None:
-        index = self.cache.get(vector_store_id)
-        if index is None:
-            raise ValueError(f"Vector DB {vector_store_id} not found. found: {self.cache.keys()}")
+    async def _get_and_cache_vector_store_index(self, vector_store_id: str) -> VectorStoreWithIndex | None:
+        if vector_store_id in self.cache:
+            return self.cache[vector_store_id]
 
-        await index.insert_chunks(chunks)
+        if self.kvstore is None:
+            raise RuntimeError("KVStore not initialized. Call initialize() before using vector stores.")
 
-    async def query_chunks(
-        self, vector_store_id: str, query: InterleavedContent, params: dict[str, Any] | None = None
-    ) -> QueryChunksResponse:
-        index = self.cache.get(vector_store_id)
-        if index is None:
+        key = f"{VECTOR_DBS_PREFIX}{vector_store_id}"
+        vector_store_data = await self.kvstore.get(key)
+        if not vector_store_data:
             raise VectorStoreNotFoundError(vector_store_id)
 
-        return await index.query_chunks(query, params)
+        vector_store = VectorStore.model_validate_json(vector_store_data)
+        index = VectorStoreWithIndex(
+            vector_store=vector_store,
+            index=await FaissIndex.create(vector_store.embedding_dimension, self.kvstore, vector_store.identifier),
+            inference_api=self.inference_api,
+        )
+        self.cache[vector_store_id] = index
+        return index
 
-    async def delete_chunks(self, store_id: str, chunks_for_deletion: list[ChunkForDeletion]) -> None:
+    async def insert_chunks(self, request: InsertChunksRequest) -> None:
+        index = self.cache.get(request.vector_store_id)
+        if index is None:
+            raise ValueError(f"Vector DB {request.vector_store_id} not found. found: {self.cache.keys()}")
+
+        await index.insert_chunks(request)
+
+    async def query_chunks(self, request: QueryChunksRequest) -> QueryChunksResponse:
+        index = self.cache.get(request.vector_store_id)
+        if index is None:
+            raise VectorStoreNotFoundError(request.vector_store_id)
+
+        return await index.query_chunks(request)
+
+    async def delete_chunks(self, request: DeleteChunksRequest) -> None:
         """Delete chunks from a faiss index"""
-        faiss_index = self.cache[store_id].index
-        await faiss_index.delete_chunks(chunks_for_deletion)
+        faiss_index = self.cache[request.vector_store_id].index
+        await faiss_index.delete_chunks(request.chunks)

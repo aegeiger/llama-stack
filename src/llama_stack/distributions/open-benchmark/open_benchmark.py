@@ -5,8 +5,6 @@
 # the root directory of this source tree.
 
 
-from llama_stack.apis.datasets import DatasetPurpose, URIDataSource
-from llama_stack.apis.models import ModelType
 from llama_stack.core.datatypes import (
     BenchmarkInput,
     BuildProvider,
@@ -34,6 +32,7 @@ from llama_stack.providers.remote.vector_io.pgvector.config import (
     PGVectorVectorIOConfig,
 )
 from llama_stack.providers.utils.inference.model_registry import ProviderModelEntry
+from llama_stack_api import DatasetPurpose, ModelType, URIDataSource
 
 
 def get_inference_providers() -> tuple[list[Provider], dict[str, list[ProviderModelEntry]]]:
@@ -262,7 +261,7 @@ def get_distribution_template() -> DistributionTemplate:
         providers=providers,
         available_models_by_provider=available_models,
         run_configs={
-            "run.yaml": RunConfigSettings(
+            "config.yaml": RunConfigSettings(
                 provider_overrides={
                     "inference": inference_providers,
                     "vector_io": vector_io_providers,

@@ -1,5 +1,5 @@
 version: 2
-image_name: dell
+distro_name: dell
 apis:
 - agents
 - datasetio
@@ -112,6 +112,9 @@ storage:
     prompts:
       namespace: prompts
       backend: kv_default
+    connectors:
+      namespace: connectors
+      backend: kv_default
 registered_resources:
   models:
   - metadata: {}
@@ -140,5 +143,3 @@ registered_resources:
     provider_id: rag-runtime
 server:
   port: 8321
-telemetry:
-  enabled: true

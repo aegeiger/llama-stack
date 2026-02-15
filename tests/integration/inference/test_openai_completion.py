@@ -27,9 +27,11 @@ def _normalize_text(text: str) -> str:
 
 
 def provider_from_model(client_with_models, model_id):
-    models = {m.identifier: m for m in client_with_models.models.list()}
-    models.update({m.provider_resource_id: m for m in client_with_models.models.list()})
-    provider_id = models[model_id].provider_id
+    models = {m.id: m for m in client_with_models.models.list()}
+    models.update(
+        {m.custom_metadata["provider_resource_id"]: m for m in client_with_models.models.list() if m.custom_metadata}
+    )
+    provider_id = models[model_id].custom_metadata["provider_id"]
     providers = {p.provider_id: p for p in client_with_models.providers.list()}
     return providers[provider_id]
 
@@ -52,6 +54,8 @@ def skip_if_model_doesnt_support_openai_completion(client_with_models, model_id)
         # {"error":{"message":"Unknown request URL: GET /openai/v1/completions. Please check the URL for typos,
         # or see the docs at https://console.groq.com/docs/","type":"invalid_request_error","code":"unknown_url"}}
         "remote::groq",
+        "remote::llama-cpp-server",
+        "remote::oci",
         "remote::gemini",  # https://generativelanguage.googleapis.com/v1beta/openai/completions -> 404
         "remote::anthropic",  # at least claude-3-{5,7}-{haiku,sonnet}-* / claude-{sonnet,opus}-4-* are not supported
         "remote::azure",  # {'error': {'code': 'OperationNotSupported', 'message': 'The completion operation
@@ -121,7 +125,6 @@ def skip_if_model_doesnt_support_openai_chat_completion(client_with_models, mode
         "inline::meta-reference",
         "inline::sentence-transformers",
         "remote::vllm",
-        "remote::bedrock",
         "remote::databricks",
         "remote::cerebras",
         "remote::runpod",
@@ -141,6 +144,15 @@ def skip_if_provider_isnt_openai(client_with_models, model_id):
         pytest.skip(
             f"Model {model_id} hosted by {provider.provider_type} doesn't support chat completion calls with base64 encoded files."
         )
+
+
+def skip_if_provider_doesnt_support_tool_calling(client_with_models, model_id):
+    """Skip tests for providers that don't support tool calling in their OpenAI-compatible API."""
+    provider = provider_from_model(client_with_models, model_id)
+    if provider.provider_type in (
+        "remote::bedrock",  # Bedrock's OpenAI endpoint doesn't support tool calling
+    ):
+        pytest.skip(f"Model {model_id} hosted by {provider.provider_type} doesn't support tool calling.")
 
 
 @pytest.mark.parametrize(
@@ -396,6 +408,7 @@ def test_inference_store(compat_client, client_with_models, text_model_id, strea
 )
 def test_inference_store_tool_calls(compat_client, client_with_models, text_model_id, stream):
     skip_if_model_doesnt_support_openai_chat_completion(client_with_models, text_model_id)
+    skip_if_provider_doesnt_support_tool_calling(client_with_models, text_model_id)
     client = compat_client
     # make a chat completion
     message = "What's the weather in Tokyo? Use the get_weather function to get the weather."

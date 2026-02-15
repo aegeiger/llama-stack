@@ -97,8 +97,10 @@ See the [Qdrant documentation](https://qdrant.tech/documentation/) for more deta
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `path` | `<class 'str'>` | No |  |  |
-| `persistence` | `<class 'llama_stack.core.storage.datatypes.KVStoreReference'>` | No |  |  |
+| `path` | `str` | No |  |  |
+| `persistence` | `KVStoreReference` | No |  |  |
+| `persistence.namespace` | `str` | No |  | Key prefix for KVStore backends |
+| `persistence.backend` | `str` | No |  | Name of backend from storage.backends |
 
 ## Sample Configuration
 

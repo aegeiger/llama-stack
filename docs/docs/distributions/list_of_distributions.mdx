@@ -14,7 +14,6 @@ Llama Stack provides several pre-configured distributions to help you get starte
 | Distribution | Use Case | Hardware Requirements | Provider |
 |--------------|----------|----------------------|----------|
 | `distribution-starter` | General purpose, prototyping | Any (CPU/GPU) | Ollama, Remote APIs |
-| `distribution-meta-reference-gpu` | High-performance inference | GPU required | Local GPU inference |
 | Remote-hosted | Production, managed service | None | Partner providers |
 | iOS/Android SDK | Mobile applications | Mobile device | On-device inference |
 
@@ -28,7 +27,7 @@ Llama Stack provides several pre-configured distributions to help you get starte
 - Run locally with Ollama for development
 
 ```bash
-docker pull llama-stack/distribution-starter
+docker pull llamastack/distribution-starter
 ```
 
 **Guides:** [Starter Distribution Guide](self_hosted_distro/starter)
@@ -41,7 +40,7 @@ docker pull llama-stack/distribution-starter
 - Need to run inference locally
 
 ```bash
-docker pull llama-stack/distribution-meta-reference-gpu
+docker pull llamastack/distribution-meta-reference-gpu
 ```
 
 **Guides:** [Meta Reference GPU Guide](self_hosted_distro/meta-reference-gpu)
@@ -131,4 +130,4 @@ graph TD
 3. **Configure your providers** with API keys or local models
 4. **Start building** with Llama Stack!
 
-For help choosing or troubleshooting, check our [Getting Started Guide](/docs/getting_started/quickstart) or [Community Support](https://github.com/llamastack/llama-stack/discussions).
+For help choosing or troubleshooting, check our [Getting Started Guide](/docs/getting_started/quickstart) or [GitHub Issues](https://github.com/llamastack/llama-stack/issues).

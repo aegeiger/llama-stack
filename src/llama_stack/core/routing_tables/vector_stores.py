@@ -6,26 +6,36 @@
 
 from typing import Any
 
-from llama_stack.apis.common.errors import ModelNotFoundError, ModelTypeError
-from llama_stack.apis.models import ModelType
-from llama_stack.apis.resource import ResourceType
-
-# Removed VectorStores import to avoid exposing public API
-from llama_stack.apis.vector_io.vector_io import (
-    SearchRankingOptions,
-    VectorStoreChunkingStrategy,
-    VectorStoreDeleteResponse,
-    VectorStoreFileContentsResponse,
-    VectorStoreFileDeleteResponse,
-    VectorStoreFileObject,
-    VectorStoreFileStatus,
-    VectorStoreObject,
-    VectorStoreSearchResponsePage,
-)
 from llama_stack.core.datatypes import (
     VectorStoreWithOwner,
 )
 from llama_stack.log import get_logger
+
+# Removed VectorStores import to avoid exposing public API
+from llama_stack_api import (
+    InsertChunksRequest,
+    ModelNotFoundError,
+    ModelType,
+    ModelTypeError,
+    OpenAIAttachFileRequest,
+    OpenAICreateVectorStoreFileBatchRequestWithExtraBody,
+    OpenAISearchVectorStoreRequest,
+    OpenAIUpdateVectorStoreFileRequest,
+    OpenAIUpdateVectorStoreRequest,
+    QueryChunksRequest,
+    QueryChunksResponse,
+    ResourceType,
+    VectorStoreDeleteResponse,
+    VectorStoreFileBatchObject,
+    VectorStoreFileContentResponse,
+    VectorStoreFileDeleteResponse,
+    VectorStoreFileObject,
+    VectorStoreFilesListInBatchResponse,
+    VectorStoreFileStatus,
+    VectorStoreListFilesResponse,
+    VectorStoreObject,
+    VectorStoreSearchResponsePage,
+)
 
 from .common import CommonRoutingTableImpl, lookup_model
 
@@ -39,7 +49,20 @@ class VectorStoresRoutingTable(CommonRoutingTableImpl):
     Only provides internal routing functionality for VectorIORouter.
     """
 
+    def __init__(
+        self,
+        impls_by_provider_id: dict[str, Any],
+        dist_registry: Any,
+        policy: list[Any],
+    ) -> None:
+        super().__init__(impls_by_provider_id, dist_registry, policy)
+        self.vector_io_router = None  # Will be set post-instantiation
+
     # Internal methods only - no public API exposure
+
+    async def list_vector_stores(self) -> list[VectorStoreWithOwner]:
+        """List all registered vector stores."""
+        return await self.get_all_with_type(ResourceType.vector_store.value)
 
     async def register_vector_store(
         self,
@@ -77,6 +100,22 @@ class VectorStoresRoutingTable(CommonRoutingTableImpl):
         await self.register_object(vector_store)
         return vector_store
 
+    async def insert_chunks(
+        self,
+        request: InsertChunksRequest,
+    ) -> None:
+        await self.assert_action_allowed("update", "vector_store", request.vector_store_id)
+        provider = await self.get_provider_impl(request.vector_store_id)
+        return await provider.insert_chunks(request)
+
+    async def query_chunks(
+        self,
+        request: QueryChunksRequest,
+    ) -> QueryChunksResponse:
+        await self.assert_action_allowed("read", "vector_store", request.vector_store_id)
+        provider = await self.get_provider_impl(request.vector_store_id)
+        return await provider.query_chunks(request)
+
     async def openai_retrieve_vector_store(
         self,
         vector_store_id: str,
@@ -88,18 +127,11 @@ class VectorStoresRoutingTable(CommonRoutingTableImpl):
     async def openai_update_vector_store(
         self,
         vector_store_id: str,
-        name: str | None = None,
-        expires_after: dict[str, Any] | None = None,
-        metadata: dict[str, Any] | None = None,
+        request: OpenAIUpdateVectorStoreRequest,
     ) -> VectorStoreObject:
         await self.assert_action_allowed("update", "vector_store", vector_store_id)
         provider = await self.get_provider_impl(vector_store_id)
-        return await provider.openai_update_vector_store(
-            vector_store_id=vector_store_id,
-            name=name,
-            expires_after=expires_after,
-            metadata=metadata,
-        )
+        return await provider.openai_update_vector_store(vector_store_id, request)
 
     async def openai_delete_vector_store(
         self,
@@ -124,40 +156,20 @@ class VectorStoresRoutingTable(CommonRoutingTableImpl):
     async def openai_search_vector_store(
         self,
         vector_store_id: str,
-        query: str | list[str],
-        filters: dict[str, Any] | None = None,
-        max_num_results: int | None = 10,
-        ranking_options: SearchRankingOptions | None = None,
-        rewrite_query: bool | None = False,
-        search_mode: str | None = "vector",
+        request: OpenAISearchVectorStoreRequest,
     ) -> VectorStoreSearchResponsePage:
         await self.assert_action_allowed("read", "vector_store", vector_store_id)
         provider = await self.get_provider_impl(vector_store_id)
-        return await provider.openai_search_vector_store(
-            vector_store_id=vector_store_id,
-            query=query,
-            filters=filters,
-            max_num_results=max_num_results,
-            ranking_options=ranking_options,
-            rewrite_query=rewrite_query,
-            search_mode=search_mode,
-        )
+        return await provider.openai_search_vector_store(vector_store_id, request)
 
     async def openai_attach_file_to_vector_store(
         self,
         vector_store_id: str,
-        file_id: str,
-        attributes: dict[str, Any] | None = None,
-        chunking_strategy: VectorStoreChunkingStrategy | None = None,
+        request: OpenAIAttachFileRequest,
     ) -> VectorStoreFileObject:
         await self.assert_action_allowed("update", "vector_store", vector_store_id)
         provider = await self.get_provider_impl(vector_store_id)
-        return await provider.openai_attach_file_to_vector_store(
-            vector_store_id=vector_store_id,
-            file_id=file_id,
-            attributes=attributes,
-            chunking_strategy=chunking_strategy,
-        )
+        return await provider.openai_attach_file_to_vector_store(vector_store_id, request)
 
     async def openai_list_files_in_vector_store(
         self,
@@ -167,7 +179,7 @@ class VectorStoresRoutingTable(CommonRoutingTableImpl):
         after: str | None = None,
         before: str | None = None,
         filter: VectorStoreFileStatus | None = None,
-    ) -> list[VectorStoreFileObject]:
+    ) -> VectorStoreListFilesResponse:
         await self.assert_action_allowed("read", "vector_store", vector_store_id)
         provider = await self.get_provider_impl(vector_store_id)
         return await provider.openai_list_files_in_vector_store(
@@ -195,26 +207,31 @@ class VectorStoresRoutingTable(CommonRoutingTableImpl):
         self,
         vector_store_id: str,
         file_id: str,
-    ) -> VectorStoreFileContentsResponse:
+        include_embeddings: bool | None = False,
+        include_metadata: bool | None = False,
+    ) -> VectorStoreFileContentResponse:
         await self.assert_action_allowed("read", "vector_store", vector_store_id)
+
         provider = await self.get_provider_impl(vector_store_id)
         return await provider.openai_retrieve_vector_store_file_contents(
             vector_store_id=vector_store_id,
             file_id=file_id,
+            include_embeddings=include_embeddings,
+            include_metadata=include_metadata,
         )
 
     async def openai_update_vector_store_file(
         self,
         vector_store_id: str,
         file_id: str,
-        attributes: dict[str, Any],
+        request: OpenAIUpdateVectorStoreFileRequest,
     ) -> VectorStoreFileObject:
         await self.assert_action_allowed("update", "vector_store", vector_store_id)
         provider = await self.get_provider_impl(vector_store_id)
         return await provider.openai_update_vector_store_file(
             vector_store_id=vector_store_id,
             file_id=file_id,
-            attributes=attributes,
+            request=request,
         )
 
     async def openai_delete_vector_store_file(
@@ -232,24 +249,20 @@ class VectorStoresRoutingTable(CommonRoutingTableImpl):
     async def openai_create_vector_store_file_batch(
         self,
         vector_store_id: str,
-        file_ids: list[str],
-        attributes: dict[str, Any] | None = None,
-        chunking_strategy: Any | None = None,
-    ):
+        params: OpenAICreateVectorStoreFileBatchRequestWithExtraBody,
+    ) -> VectorStoreFileBatchObject:
         await self.assert_action_allowed("update", "vector_store", vector_store_id)
         provider = await self.get_provider_impl(vector_store_id)
         return await provider.openai_create_vector_store_file_batch(
             vector_store_id=vector_store_id,
-            file_ids=file_ids,
-            attributes=attributes,
-            chunking_strategy=chunking_strategy,
+            params=params,
         )
 
     async def openai_retrieve_vector_store_file_batch(
         self,
         batch_id: str,
         vector_store_id: str,
-    ):
+    ) -> VectorStoreFileBatchObject:
         await self.assert_action_allowed("read", "vector_store", vector_store_id)
         provider = await self.get_provider_impl(vector_store_id)
         return await provider.openai_retrieve_vector_store_file_batch(
@@ -266,7 +279,7 @@ class VectorStoresRoutingTable(CommonRoutingTableImpl):
         filter: str | None = None,
         limit: int | None = 20,
         order: str | None = "desc",
-    ):
+    ) -> VectorStoreFilesListInBatchResponse:
         await self.assert_action_allowed("read", "vector_store", vector_store_id)
         provider = await self.get_provider_impl(vector_store_id)
         return await provider.openai_list_files_in_vector_store_file_batch(
@@ -283,7 +296,7 @@ class VectorStoresRoutingTable(CommonRoutingTableImpl):
         self,
         batch_id: str,
         vector_store_id: str,
-    ):
+    ) -> VectorStoreFileBatchObject:
         await self.assert_action_allowed("update", "vector_store", vector_store_id)
         provider = await self.get_provider_impl(vector_store_id)
         return await provider.openai_cancel_vector_store_file_batch(

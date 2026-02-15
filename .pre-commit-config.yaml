@@ -1,5 +1,6 @@
 exclude: 'build/'
-
+minimum_pre_commit_version: 4.4.0
+x-uv-dependency: &uv-dependency "uv==0.9.15"
 default_language_version:
     python: python3.12
     node: "22"
@@ -19,6 +20,7 @@ repos:
     -   id: no-commit-to-branch
     -   id: check-yaml
         args: ["--unsafe"]
+        exclude: 'docs/static/openai-spec-2.3.0.yml'
     -   id: detect-private-key
     -   id: mixed-line-ending
         args: [--fix=lf] # Forces to replace line ending by LF (line feed)
@@ -42,7 +44,6 @@ repos:
     hooks:
     -   id: ruff
         args: [ --fix ]
-        exclude: ^src/llama_stack/strong_typing/.*$
     -   id: ruff-format
 
 -   repo: https://github.com/adamchainz/blacken-docs
@@ -58,7 +59,7 @@ repos:
     hooks:
     -   id: mypy
         additional_dependencies:
-          - uv==0.6.2
+          - *uv-dependency
           - mypy
           - pytest
           - rich
@@ -77,7 +78,7 @@ repos:
       - id: uv-lock
         name: uv-lock
         additional_dependencies:
-          - uv==0.7.20
+          - *uv-dependency
         entry: ./scripts/uv-run-with-index.sh lock
         language: python
         pass_filenames: false
@@ -92,7 +93,7 @@ repos:
       - id: distro-codegen
         name: Distribution Template Codegen
         additional_dependencies:
-          - uv==0.7.8
+          - *uv-dependency
         entry: ./scripts/uv-run-with-index.sh run --group codegen ./scripts/distro_codegen.py
         language: python
         pass_filenames: false
@@ -101,21 +102,39 @@ repos:
       - id: provider-codegen
         name: Provider Codegen
         additional_dependencies:
-          - uv==0.7.8
-        entry: ./scripts/uv-run-with-index.sh run --group codegen ./scripts/provider_codegen.py
+          - *uv-dependency
+        entry: sh -c 'env -i PATH="$PATH" ./scripts/uv-run-with-index.sh run --group codegen ./scripts/provider_codegen.py'
         language: python
         pass_filenames: false
         require_serial: true
-        files: ^src/llama_stack/providers/.*$
+        files: ^src/llama_stack/providers/.*$|^scripts/run_openapi_generator.sh$
       - id: openapi-codegen
         name: API Spec Codegen
         additional_dependencies:
-          - uv==0.7.8
-        entry: sh -c './scripts/uv-run-with-index.sh run ./docs/openapi_generator/run_openapi_generator.sh > /dev/null'
+          - *uv-dependency
+        entry: sh -c './scripts/uv-run-with-index.sh run scripts/run_openapi_generator.sh'
         language: python
         pass_filenames: false
         require_serial: true
-        files: ^src/llama_stack/apis/|^docs/openapi_generator/
+        files: ^src/llama_stack_api/.*$
+      - id: api-conformance
+        name: Check API spec for breaking changes
+        entry: ./scripts/check-api-conformance.sh
+        language: golang
+        additional_dependencies:
+          - github.com/oasdiff/oasdiff@latest
+        pass_filenames: false
+        require_serial: true
+        files: ^docs/static/(llama-stack-spec|stable-llama-stack-spec|experimental-llama-stack-spec|deprecated-llama-stack-spec)\.yaml$
+      - id: openai-coverage
+        name: OpenAI API Coverage
+        additional_dependencies:
+          - *uv-dependency
+        entry: ./scripts/uv-run-with-index.sh run python scripts/openai_coverage.py --check-regression --update --generate-docs --quiet
+        language: python
+        pass_filenames: false
+        require_serial: true
+        files: ^docs/static/(llama-stack-spec\.yaml|openai-spec.*\.yml|openresponses-spec\.json|openai-coverage\.json)$|^docs/docs/api-openai/conformance\.mdx$|^scripts/(openai_coverage|generate_openai_coverage_docs)\.py$
       - id: check-workflows-use-hashes
         name: Check GitHub Actions use SHA-pinned actions
         entry: ./scripts/check-workflows-use-hashes.sh
@@ -151,7 +170,7 @@ repos:
       - id: generate-ci-docs
         name: Generate CI documentation
         additional_dependencies:
-          - uv==0.7.8
+          - *uv-dependency
         entry: ./scripts/uv-run-with-index.sh run ./scripts/gen-ci-docs.py
         language: python
         pass_filenames: false
@@ -161,7 +180,7 @@ repos:
         name: Format & Lint UI
         entry: bash ./scripts/run-ui-linter.sh
         language: system
-        files: ^src/llama_stack/ui/.*\.(ts|tsx)$
+        files: ^src/llama_stack_ui/.*\.(ts|tsx)$
         pass_filenames: false
         require_serial: true
 
@@ -200,6 +219,27 @@ repos:
               echo;
               exit 1;
             } || true
+      - id: check-api-independence
+        name: Ensure llama_stack_api does not import llama_stack
+        entry: bash
+        language: system
+        pass_filenames: false
+        require_serial: true
+        always_run: true
+        files: ^src/llama_stack_api/.*$
+        args:
+          - -c
+          - |
+            API_DIR="src/llama_stack_api"
+            grep -rn --include="*.py" -E '^[^#]*(import llama_stack\b|from llama_stack\b)' "$API_DIR" 2>/dev/null && {
+              echo "llama_stack_api must not import llama_stack";
+              exit 1;
+            }
+            [ -f "$API_DIR/pyproject.toml" ] && grep -n 'llama_stack[^_]' "$API_DIR/pyproject.toml" && {
+              echo "llama_stack_api must not depend on llama_stack in pyproject.toml";
+              exit 1;
+            }
+            exit 0
 
 ci:
     autofix_commit_msg: 🎨 [pre-commit.ci] Auto format from pre-commit.com hooks
@@ -207,5 +247,5 @@ ci:
     autofix_prs: true
     autoupdate_branch: ''
     autoupdate_schedule: weekly
-    skip: []
+    skip: [api-conformance]  # requires git history; covered by pre-commit.yml workflow
     submodules: false

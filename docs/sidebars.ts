@@ -41,6 +41,15 @@ const sidebars: SidebarsConfig = {
             'concepts/apis/api_leveling',
           ],
         },
+        {
+          type: 'category',
+          label: 'Vector Stores',
+          collapsed: true,
+          items: [
+            'concepts/file_operations_vector_stores',
+            'concepts/vector_stores_configuration',
+          ],
+        },
         'concepts/distributions',
         'concepts/resources',
       ],
@@ -57,6 +66,7 @@ const sidebars: SidebarsConfig = {
         'distributions/importing_as_library',
         'distributions/configuration',
         'distributions/starting_llama_stack_server',
+        'distributions/llama_stack_ui',
         {
           type: 'category',
           label: 'Self-Hosted Distributions',
@@ -65,7 +75,6 @@ const sidebars: SidebarsConfig = {
             'distributions/self_hosted_distro/starter',
             'distributions/self_hosted_distro/dell',
             'distributions/self_hosted_distro/dell-tgi',
-            'distributions/self_hosted_distro/meta-reference-gpu',
             'distributions/self_hosted_distro/nvidia',
             'distributions/self_hosted_distro/passthrough',
           ],
@@ -102,7 +111,6 @@ const sidebars: SidebarsConfig = {
           collapsed: true,
           items: [
             'providers/inference/index',
-            'providers/inference/inline_meta-reference',
             'providers/inference/inline_sentence-transformers',
             'providers/inference/remote_anthropic',
             'providers/inference/remote_azure',
@@ -159,7 +167,9 @@ const sidebars: SidebarsConfig = {
             'providers/vector_io/remote_milvus',
             'providers/vector_io/remote_pgvector',
             'providers/vector_io/remote_qdrant',
-            'providers/vector_io/remote_weaviate'
+            'providers/vector_io/remote_weaviate',
+            'providers/vector_io/remote_elasticsearch',
+            'providers/vector_io/remote_oci'
           ],
         },
         {

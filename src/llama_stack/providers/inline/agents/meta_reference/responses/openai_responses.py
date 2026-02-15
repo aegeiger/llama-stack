@@ -4,51 +4,64 @@
 # This source code is licensed under the terms described in the LICENSE file in
 # the root directory of this source tree.
 
+import re
 import time
 import uuid
 from collections.abc import AsyncIterator
 
 from pydantic import BaseModel, TypeAdapter
 
-from llama_stack.apis.agents import Order
-from llama_stack.apis.agents.agents import ResponseGuardrailSpec
-from llama_stack.apis.agents.openai_responses import (
-    ListOpenAIResponseInputItem,
-    ListOpenAIResponseObject,
-    OpenAIDeleteResponseObject,
-    OpenAIResponseInput,
-    OpenAIResponseInputMessageContentText,
-    OpenAIResponseInputTool,
-    OpenAIResponseMessage,
-    OpenAIResponseObject,
-    OpenAIResponseObjectStream,
-    OpenAIResponsePrompt,
-    OpenAIResponseText,
-    OpenAIResponseTextFormat,
-)
-from llama_stack.apis.common.errors import (
-    InvalidConversationIdError,
-)
-from llama_stack.apis.conversations import Conversations
-from llama_stack.apis.conversations.conversations import ConversationItem
-from llama_stack.apis.inference import (
-    Inference,
-    OpenAIMessageParam,
-    OpenAISystemMessageParam,
-)
-from llama_stack.apis.safety import Safety
-from llama_stack.apis.tools import ToolGroups, ToolRuntime
-from llama_stack.apis.vector_io import VectorIO
 from llama_stack.log import get_logger
 from llama_stack.providers.utils.responses.responses_store import (
     ResponsesStore,
     _OpenAIResponseObjectWithInputAndMessages,
+)
+from llama_stack.providers.utils.tools.mcp import MCPSessionManager
+from llama_stack_api import (
+    AddItemsRequest,
+    Connectors,
+    ConversationItem,
+    Conversations,
+    Files,
+    Inference,
+    InvalidConversationIdError,
+    ListItemsRequest,
+    ListOpenAIResponseInputItem,
+    ListOpenAIResponseObject,
+    OpenAIChatCompletionContentPartParam,
+    OpenAIDeleteResponseObject,
+    OpenAIMessageParam,
+    OpenAIResponseInput,
+    OpenAIResponseInputMessageContentFile,
+    OpenAIResponseInputMessageContentImage,
+    OpenAIResponseInputMessageContentText,
+    OpenAIResponseInputTool,
+    OpenAIResponseInputToolChoice,
+    OpenAIResponseMessage,
+    OpenAIResponseObject,
+    OpenAIResponseObjectStream,
+    OpenAIResponsePrompt,
+    OpenAIResponseReasoning,
+    OpenAIResponseText,
+    OpenAIResponseTextFormat,
+    OpenAISystemMessageParam,
+    OpenAIUserMessageParam,
+    Order,
+    Prompts,
+    ResponseGuardrailSpec,
+    ResponseItemInclude,
+    ResponseTruncation,
+    Safety,
+    ToolGroups,
+    ToolRuntime,
+    VectorIO,
 )
 
 from .streaming import StreamingResponseOrchestrator
 from .tool_executor import ToolExecutor
 from .types import ChatCompletionContext, ToolContext
 from .utils import (
+    convert_response_content_to_chat_content,
     convert_response_input_to_chat_messages,
     convert_response_text_to_chat_response_format,
     extract_guardrail_ids,
@@ -70,8 +83,12 @@ class OpenAIResponsesImpl:
         tool_runtime_api: ToolRuntime,
         responses_store: ResponsesStore,
         vector_io_api: VectorIO,  # VectorIO
-        safety_api: Safety,
+        safety_api: Safety | None,
         conversations_api: Conversations,
+        prompts_api: Prompts,
+        files_api: Files,
+        connectors_api: Connectors,
+        vector_stores_config=None,
     ):
         self.inference_api = inference_api
         self.tool_groups_api = tool_groups_api
@@ -84,7 +101,11 @@ class OpenAIResponsesImpl:
             tool_groups_api=tool_groups_api,
             tool_runtime_api=tool_runtime_api,
             vector_io_api=vector_io_api,
+            vector_stores_config=vector_stores_config,
         )
+        self.prompts_api = prompts_api
+        self.files_api = files_api
+        self.connectors_api = connectors_api
 
     async def _prepend_previous_response(
         self,
@@ -125,15 +146,19 @@ class OpenAIResponsesImpl:
                 # Use stored messages directly and convert only new input
                 message_adapter = TypeAdapter(list[OpenAIMessageParam])
                 messages = message_adapter.validate_python(previous_response.messages)
-                new_messages = await convert_response_input_to_chat_messages(input, previous_messages=messages)
+                new_messages = await convert_response_input_to_chat_messages(
+                    input, previous_messages=messages, files_api=self.files_api
+                )
                 messages.extend(new_messages)
             else:
                 # Backward compatibility: reconstruct from inputs
-                messages = await convert_response_input_to_chat_messages(all_input)
+                messages = await convert_response_input_to_chat_messages(all_input, files_api=self.files_api)
 
             tool_context.recover_tools_from_previous_response(previous_response)
         elif conversation is not None:
-            conversation_items = await self.conversations_api.list_items(conversation, order="asc")
+            conversation_items = await self.conversations_api.list_items(
+                ListItemsRequest(conversation_id=conversation, order="asc")
+            )
 
             # Use stored messages as source of truth (like previous_response.messages)
             stored_messages = await self.responses_store.get_conversation_messages(conversation)
@@ -141,7 +166,7 @@ class OpenAIResponsesImpl:
             all_input = input
             if not conversation_items.data:
                 # First turn - just convert the new input
-                messages = await convert_response_input_to_chat_messages(input)
+                messages = await convert_response_input_to_chat_messages(input, files_api=self.files_api)
             else:
                 if not stored_messages:
                     all_input = conversation_items.data
@@ -157,13 +182,81 @@ class OpenAIResponsesImpl:
                     all_input = input
 
                 messages = stored_messages or []
-                new_messages = await convert_response_input_to_chat_messages(all_input, previous_messages=messages)
+                new_messages = await convert_response_input_to_chat_messages(
+                    all_input, previous_messages=messages, files_api=self.files_api
+                )
                 messages.extend(new_messages)
         else:
             all_input = input
-            messages = await convert_response_input_to_chat_messages(all_input)
+            messages = await convert_response_input_to_chat_messages(all_input, files_api=self.files_api)
 
         return all_input, messages, tool_context
+
+    async def _prepend_prompt(
+        self,
+        messages: list[OpenAIMessageParam],
+        openai_response_prompt: OpenAIResponsePrompt | None,
+    ) -> None:
+        """Prepend prompt template to messages, resolving text/image/file variables.
+
+        :param messages: List of OpenAIMessageParam objects
+        :param openai_response_prompt: (Optional) OpenAIResponsePrompt object with variables
+        :returns: string of utf-8 characters
+        """
+        if not openai_response_prompt or not openai_response_prompt.id:
+            return
+
+        prompt_version = int(openai_response_prompt.version) if openai_response_prompt.version else None
+        cur_prompt = await self.prompts_api.get_prompt(openai_response_prompt.id, prompt_version)
+
+        if not cur_prompt or not cur_prompt.prompt:
+            return
+
+        cur_prompt_text = cur_prompt.prompt
+        cur_prompt_variables = cur_prompt.variables
+
+        if not openai_response_prompt.variables:
+            messages.insert(0, OpenAISystemMessageParam(content=cur_prompt_text))
+            return
+
+        # Validate that all provided variables exist in the prompt
+        for name in openai_response_prompt.variables.keys():
+            if name not in cur_prompt_variables:
+                raise ValueError(f"Variable {name} not found in prompt {openai_response_prompt.id}")
+
+        # Separate text and media variables
+        text_substitutions = {}
+        media_content_parts: list[OpenAIChatCompletionContentPartParam] = []
+
+        for name, value in openai_response_prompt.variables.items():
+            # Text variable found
+            if isinstance(value, OpenAIResponseInputMessageContentText):
+                text_substitutions[name] = value.text
+
+            # Media variable found
+            elif isinstance(value, OpenAIResponseInputMessageContentImage | OpenAIResponseInputMessageContentFile):
+                converted_parts = await convert_response_content_to_chat_content([value], files_api=self.files_api)
+                if isinstance(converted_parts, list):
+                    media_content_parts.extend(converted_parts)
+
+                # Eg: {{product_photo}} becomes "[Image: product_photo]"
+                # This gives the model textual context about what media exists in the prompt
+                var_type = value.type.replace("input_", "").replace("_", " ").title()
+                text_substitutions[name] = f"[{var_type}: {name}]"
+
+        def replace_variable(match: re.Match[str]) -> str:
+            var_name = match.group(1).strip()
+            return str(text_substitutions.get(var_name, match.group(0)))
+
+        pattern = r"\{\{\s*(\w+)\s*\}\}"
+        processed_prompt_text = re.sub(pattern, replace_variable, cur_prompt_text)
+
+        # Insert system message with resolved text
+        messages.insert(0, OpenAISystemMessageParam(content=processed_prompt_text))
+
+        # If we have media, create a new user message because allows to ingest images and files
+        if media_content_parts:
+            messages.append(OpenAIUserMessageParam(content=media_content_parts))
 
     async def get_openai_response(
         self,
@@ -186,7 +279,7 @@ class OpenAIResponsesImpl:
         response_id: str,
         after: str | None = None,
         before: str | None = None,
-        include: list[str] | None = None,
+        include: list[ResponseItemInclude] | None = None,
         limit: int | None = 20,
         order: Order | None = Order.desc,
     ) -> ListOpenAIResponseInputItem:
@@ -239,6 +332,125 @@ class OpenAIResponsesImpl:
             messages=messages,
         )
 
+    def _prepare_input_items_for_storage(
+        self,
+        input: str | list[OpenAIResponseInput],
+    ) -> list[OpenAIResponseInput]:
+        """Prepare input items for storage, adding IDs where needed.
+
+        This method is called once at the start of streaming to prepare input items
+        that will be reused across multiple persistence calls during streaming.
+        """
+        new_input_id = f"msg_{uuid.uuid4()}"
+        input_items_data: list[OpenAIResponseInput] = []
+
+        if isinstance(input, str):
+            input_content = OpenAIResponseInputMessageContentText(text=input)
+            input_content_item = OpenAIResponseMessage(
+                role="user",
+                content=[input_content],
+                id=new_input_id,
+            )
+            input_items_data = [input_content_item]
+        else:
+            for input_item in input:
+                if isinstance(input_item, OpenAIResponseMessage):
+                    input_item_dict = input_item.model_dump()
+                    if "id" not in input_item_dict:
+                        input_item_dict["id"] = new_input_id
+                    input_items_data.append(OpenAIResponseMessage(**input_item_dict))
+                else:
+                    input_items_data.append(input_item)
+
+        return input_items_data
+
+    async def _persist_streaming_state(
+        self,
+        stream_chunk: OpenAIResponseObjectStream,
+        orchestrator,
+        input_items: list[OpenAIResponseInput],
+        output_items: list,
+    ) -> None:
+        """Persist response state at significant streaming events.
+
+        This enables clients to poll GET /v1/responses/{response_id} during streaming
+        to see in-progress turn state instead of empty results.
+
+        Persistence occurs at:
+        - response.in_progress: Initial INSERT with empty output
+        - response.output_item.done: UPDATE with accumulated output items
+        - response.completed/response.incomplete: Final UPDATE with complete state
+        - response.failed: UPDATE with error state
+
+        :param stream_chunk: The current streaming event.
+        :param orchestrator: The streaming orchestrator (for snapshotting response).
+        :param input_items: Pre-prepared input items for storage.
+        :param output_items: Accumulated output items so far.
+        """
+        try:
+            match stream_chunk.type:
+                case "response.in_progress":
+                    # Initial persistence when response starts
+                    in_progress_response = stream_chunk.response
+                    await self.responses_store.upsert_response_object(
+                        response_object=in_progress_response,
+                        input=input_items,
+                        messages=[],
+                    )
+
+                case "response.output_item.done":
+                    # Incremental update when an output item completes (tool call, message)
+                    current_snapshot = orchestrator._snapshot_response(
+                        status="in_progress",
+                        outputs=output_items,
+                    )
+                    # Get current messages (filter out system messages)
+                    messages_to_store = list(
+                        filter(
+                            lambda x: not isinstance(x, OpenAISystemMessageParam),
+                            orchestrator.final_messages or orchestrator.ctx.messages,
+                        )
+                    )
+                    await self.responses_store.upsert_response_object(
+                        response_object=current_snapshot,
+                        input=input_items,
+                        messages=messages_to_store,
+                    )
+
+                case "response.completed" | "response.incomplete":
+                    # Final persistence when response finishes
+                    final_response = stream_chunk.response
+                    messages_to_store = list(
+                        filter(
+                            lambda x: not isinstance(x, OpenAISystemMessageParam),
+                            orchestrator.final_messages,
+                        )
+                    )
+                    await self.responses_store.upsert_response_object(
+                        response_object=final_response,
+                        input=input_items,
+                        messages=messages_to_store,
+                    )
+
+                case "response.failed":
+                    # Persist failed state so GET shows error
+                    failed_response = stream_chunk.response
+                    # Preserve any accumulated non-system messages for failed responses
+                    messages_to_store = list(
+                        filter(
+                            lambda x: not isinstance(x, OpenAISystemMessageParam),
+                            orchestrator.final_messages or orchestrator.ctx.messages,
+                        )
+                    )
+                    await self.responses_store.upsert_response_object(
+                        response_object=failed_response,
+                        input=input_items,
+                        messages=messages_to_store,
+                    )
+        except Exception as e:
+            # Best-effort persistence: log error but don't fail the stream
+            logger.warning(f"Failed to persist streaming state for {stream_chunk.type}: {e}")
+
     async def create_openai_response(
         self,
         input: str | list[OpenAIResponseInput],
@@ -246,20 +458,50 @@ class OpenAIResponsesImpl:
         prompt: OpenAIResponsePrompt | None = None,
         instructions: str | None = None,
         previous_response_id: str | None = None,
+        prompt_cache_key: str | None = None,
         conversation: str | None = None,
         store: bool | None = True,
         stream: bool | None = False,
         temperature: float | None = None,
         text: OpenAIResponseText | None = None,
+        tool_choice: OpenAIResponseInputToolChoice | None = None,
         tools: list[OpenAIResponseInputTool] | None = None,
-        include: list[str] | None = None,
+        include: list[ResponseItemInclude] | None = None,
         max_infer_iters: int | None = 10,
         guardrails: list[str | ResponseGuardrailSpec] | None = None,
+        parallel_tool_calls: bool | None = None,
+        max_tool_calls: int | None = None,
+        reasoning: OpenAIResponseReasoning | None = None,
+        max_output_tokens: int | None = None,
+        safety_identifier: str | None = None,
+        metadata: dict[str, str] | None = None,
+        truncation: ResponseTruncation | None = None,
     ):
         stream = bool(stream)
         text = OpenAIResponseText(format=OpenAIResponseTextFormat(type="text")) if text is None else text
 
+        # Validate MCP tools: ensure Authorization header is not passed via headers dict
+        if tools:
+            from llama_stack_api.openai_responses import OpenAIResponseInputToolMCP
+
+            for tool in tools:
+                if isinstance(tool, OpenAIResponseInputToolMCP) and tool.headers:
+                    for key in tool.headers.keys():
+                        if key.lower() == "authorization":
+                            raise ValueError(
+                                "Authorization header cannot be passed via 'headers'. "
+                                "Please use the 'authorization' parameter instead."
+                            )
+
         guardrail_ids = extract_guardrail_ids(guardrails) if guardrails else []
+
+        # Validate that Safety API is available if guardrails are requested
+        if guardrail_ids and self.safety_api is None:
+            raise ValueError(
+                "Cannot process guardrails: Safety API is not configured.\n\n"
+                "To use guardrails, ensure the Safety API is configured in your stack, or remove "
+                "the 'guardrails' parameter from your request."
+            )
 
         if conversation is not None:
             if previous_response_id is not None:
@@ -274,14 +516,25 @@ class OpenAIResponsesImpl:
             input=input,
             conversation=conversation,
             model=model,
+            prompt=prompt,
             instructions=instructions,
             previous_response_id=previous_response_id,
+            prompt_cache_key=prompt_cache_key,
             store=store,
             temperature=temperature,
             text=text,
             tools=tools,
+            tool_choice=tool_choice,
             max_infer_iters=max_infer_iters,
             guardrail_ids=guardrail_ids,
+            parallel_tool_calls=parallel_tool_calls,
+            max_tool_calls=max_tool_calls,
+            reasoning=reasoning,
+            max_output_tokens=max_output_tokens,
+            safety_identifier=safety_identifier,
+            metadata=metadata,
+            include=include,
+            truncation=truncation,
         )
 
         if stream:
@@ -324,13 +577,24 @@ class OpenAIResponsesImpl:
         model: str,
         instructions: str | None = None,
         previous_response_id: str | None = None,
+        prompt_cache_key: str | None = None,
         conversation: str | None = None,
+        prompt: OpenAIResponsePrompt | None = None,
         store: bool | None = True,
         temperature: float | None = None,
         text: OpenAIResponseText | None = None,
         tools: list[OpenAIResponseInputTool] | None = None,
+        tool_choice: OpenAIResponseInputToolChoice | None = None,
         max_infer_iters: int | None = 10,
         guardrail_ids: list[str] | None = None,
+        parallel_tool_calls: bool | None = True,
+        max_tool_calls: int | None = None,
+        reasoning: OpenAIResponseReasoning | None = None,
+        max_output_tokens: int | None = None,
+        safety_identifier: str | None = None,
+        metadata: dict[str, str] | None = None,
+        include: list[ResponseItemInclude] | None = None,
+        truncation: ResponseTruncation | None = None,
     ) -> AsyncIterator[OpenAIResponseObjectStream]:
         # These should never be None when called from create_openai_response (which sets defaults)
         # but we assert here to help mypy understand the types
@@ -345,6 +609,9 @@ class OpenAIResponsesImpl:
         if instructions:
             messages.insert(0, OpenAISystemMessageParam(content=instructions))
 
+        # Prepend reusable prompt (if provided)
+        await self._prepend_prompt(messages, prompt)
+
         # Structured outputs
         response_format = await convert_response_text_to_chat_response_format(text)
 
@@ -352,6 +619,7 @@ class OpenAIResponsesImpl:
             model=model,
             messages=messages,
             response_tools=tools,
+            tool_choice=tool_choice,
             temperature=temperature,
             response_format=response_format,
             tool_context=tool_context,
@@ -362,60 +630,86 @@ class OpenAIResponsesImpl:
         response_id = f"resp_{uuid.uuid4()}"
         created_at = int(time.time())
 
-        orchestrator = StreamingResponseOrchestrator(
-            inference_api=self.inference_api,
-            ctx=ctx,
-            response_id=response_id,
-            created_at=created_at,
-            text=text,
-            max_infer_iters=max_infer_iters,
-            tool_executor=self.tool_executor,
-            safety_api=self.safety_api,
-            guardrail_ids=guardrail_ids,
-            instructions=instructions,
-        )
+        # Create a per-request MCP session manager for session reuse (fix for #4452)
+        # This avoids redundant tools/list calls when making multiple MCP tool invocations
+        async with MCPSessionManager() as mcp_session_manager:
+            request_tool_executor = ToolExecutor(
+                tool_groups_api=self.tool_groups_api,
+                tool_runtime_api=self.tool_runtime_api,
+                vector_io_api=self.vector_io_api,
+                vector_stores_config=self.tool_executor.vector_stores_config,
+                mcp_session_manager=mcp_session_manager,
+            )
 
-        # Stream the response
-        final_response = None
-        failed_response = None
+            orchestrator = StreamingResponseOrchestrator(
+                inference_api=self.inference_api,
+                ctx=ctx,
+                response_id=response_id,
+                created_at=created_at,
+                prompt=prompt,
+                prompt_cache_key=prompt_cache_key,
+                text=text,
+                max_infer_iters=max_infer_iters,
+                parallel_tool_calls=parallel_tool_calls,
+                tool_executor=request_tool_executor,
+                safety_api=self.safety_api,
+                connectors_api=self.connectors_api,
+                guardrail_ids=guardrail_ids,
+                instructions=instructions,
+                max_tool_calls=max_tool_calls,
+                reasoning=reasoning,
+                max_output_tokens=max_output_tokens,
+                safety_identifier=safety_identifier,
+                metadata=metadata,
+                include=include,
+                store=store,
+                truncation=truncation,
+            )
 
-        # Type as ConversationItem to avoid list invariance issues
-        output_items: list[ConversationItem] = []
-        async for stream_chunk in orchestrator.create_response():
-            match stream_chunk.type:
-                case "response.completed" | "response.incomplete":
-                    final_response = stream_chunk.response
-                case "response.failed":
-                    failed_response = stream_chunk.response
-                case "response.output_item.done":
-                    item = stream_chunk.item
-                    output_items.append(item)
-                case _:
-                    pass  # Other event types
+            final_response = None
+            failed_response = None
 
-            # Store and sync before yielding terminal events
-            # This ensures the storage/syncing happens even if the consumer breaks after receiving the event
-            if (
-                stream_chunk.type in {"response.completed", "response.incomplete"}
-                and final_response
-                and failed_response is None
-            ):
-                messages_to_store = list(
-                    filter(lambda x: not isinstance(x, OpenAISystemMessageParam), orchestrator.final_messages)
-                )
+            output_items: list[ConversationItem] = []
+
+            input_items_for_storage = self._prepare_input_items_for_storage(all_input)
+
+            async for stream_chunk in orchestrator.create_response():
+                match stream_chunk.type:
+                    case "response.completed" | "response.incomplete":
+                        final_response = stream_chunk.response
+                    case "response.failed":
+                        failed_response = stream_chunk.response
+                    case "response.output_item.done":
+                        item = stream_chunk.item
+                        output_items.append(item)
+                    case _:
+                        pass  # Other event types
+
+                # Incremental persistence: persist on significant state changes
+                # This enables clients to poll GET /v1/responses/{response_id} during streaming
                 if store:
-                    # TODO: we really should work off of output_items instead of "final_messages"
-                    await self._store_response(
-                        response=final_response,
-                        input=all_input,
-                        messages=messages_to_store,
+                    await self._persist_streaming_state(
+                        stream_chunk=stream_chunk,
+                        orchestrator=orchestrator,
+                        input_items=input_items_for_storage,
+                        output_items=output_items,
                     )
 
-                if conversation:
-                    await self._sync_response_to_conversation(conversation, input, output_items)
-                    await self.responses_store.store_conversation_messages(conversation, messages_to_store)
+                # Store and sync before yielding terminal events
+                # This ensures the storage/syncing happens even if the consumer breaks after receiving the event
+                if (
+                    stream_chunk.type in {"response.completed", "response.incomplete"}
+                    and final_response
+                    and failed_response is None
+                ):
+                    if conversation:
+                        messages_to_store = list(
+                            filter(lambda x: not isinstance(x, OpenAISystemMessageParam), orchestrator.final_messages)
+                        )
+                        await self._sync_response_to_conversation(conversation, input, output_items)
+                        await self.responses_store.store_conversation_messages(conversation, messages_to_store)
 
-            yield stream_chunk
+                yield stream_chunk
 
     async def delete_openai_response(self, response_id: str) -> OpenAIDeleteResponseObject:
         return await self.responses_store.delete_response_object(response_id)
@@ -438,4 +732,4 @@ class OpenAIResponsesImpl:
 
         adapter = TypeAdapter(list[ConversationItem])
         validated_items = adapter.validate_python(conversation_items)
-        await self.conversations_api.add_items(conversation_id, validated_items)
+        await self.conversations_api.add_items(conversation_id, AddItemsRequest(items=validated_items))

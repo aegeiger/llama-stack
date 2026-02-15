@@ -12,6 +12,8 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+from llama_stack.core.utils.config_dirs import DISTRIBS_BASE_DIR
+
 
 class StorageBackendType(StrEnum):
     KV_REDIS = "kv_redis"
@@ -253,18 +255,32 @@ class InferenceStoreReference(SqlStoreReference):
 class ResponsesStoreReference(InferenceStoreReference):
     """Responses store configuration with queue tuning."""
 
+    table_name: str = Field(
+        default="openai_responses",
+        description="Name of the table to use for storing OpenAI responses",
+    )
+
 
 class ServerStoresConfig(BaseModel):
     metadata: KVStoreReference | None = Field(
-        default=None,
+        default=KVStoreReference(
+            backend="kv_default",
+            namespace="registry",
+        ),
         description="Metadata store configuration (uses KV backend)",
     )
     inference: InferenceStoreReference | None = Field(
-        default=None,
+        default=InferenceStoreReference(
+            backend="sql_default",
+            table_name="inference_store",
+        ),
         description="Inference store configuration (uses SQL backend)",
     )
     conversations: SqlStoreReference | None = Field(
-        default=None,
+        default=SqlStoreReference(
+            backend="sql_default",
+            table_name="openai_conversations",
+        ),
         description="Conversations store configuration (uses SQL backend)",
     )
     responses: ResponsesStoreReference | None = Field(
@@ -272,13 +288,25 @@ class ServerStoresConfig(BaseModel):
         description="Responses store configuration (uses SQL backend)",
     )
     prompts: KVStoreReference | None = Field(
-        default=None,
+        default=KVStoreReference(backend="kv_default", namespace="prompts"),
         description="Prompts store configuration (uses KV backend)",
+    )
+    connectors: KVStoreReference | None = Field(
+        default=KVStoreReference(backend="kv_default", namespace="connectors"),
+        description="Connectors store configuration (uses KV backend)",
     )
 
 
 class StorageConfig(BaseModel):
     backends: dict[str, StorageBackendConfig] = Field(
+        default={
+            "kv_default": SqliteKVStoreConfig(
+                db_path=f"${{env.SQLITE_STORE_DIR:={DISTRIBS_BASE_DIR}}}/kvstore.db",
+            ),
+            "sql_default": SqliteSqlStoreConfig(
+                db_path=f"${{env.SQLITE_STORE_DIR:={DISTRIBS_BASE_DIR}}}/sql_store.db",
+            ),
+        },
         description="Named backend configurations (e.g., 'default', 'cache')",
     )
     stores: ServerStoresConfig = Field(

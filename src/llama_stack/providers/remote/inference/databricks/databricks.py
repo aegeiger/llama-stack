@@ -4,13 +4,13 @@
 # This source code is licensed under the terms described in the LICENSE file in
 # the root directory of this source tree.
 
-from collections.abc import Iterable
+from collections.abc import AsyncIterator, Iterable
 
 from databricks.sdk import WorkspaceClient
 
-from llama_stack.apis.inference import OpenAICompletion, OpenAICompletionRequestWithExtraBody
 from llama_stack.log import get_logger
 from llama_stack.providers.utils.inference.openai_mixin import OpenAIMixin
+from llama_stack_api import OpenAICompletion, OpenAICompletionRequestWithExtraBody
 
 from .config import DatabricksImplConfig
 
@@ -29,20 +29,26 @@ class DatabricksInferenceAdapter(OpenAIMixin):
     }
 
     def get_base_url(self) -> str:
-        return f"{self.config.url}/serving-endpoints"
+        return str(self.config.base_url)
 
     async def list_provider_model_ids(self) -> Iterable[str]:
         # Filter out None values from endpoint names
         api_token = self._get_api_key_from_config_or_provider_data()
+        # WorkspaceClient expects base host without /serving-endpoints suffix
+        base_url_str = str(self.config.base_url)
+        if base_url_str.endswith("/serving-endpoints"):
+            host = base_url_str[:-18]  # Remove '/serving-endpoints'
+        else:
+            host = base_url_str
         return [
             endpoint.name  # type: ignore[misc]
             for endpoint in WorkspaceClient(
-                host=self.config.url, token=api_token
+                host=host, token=api_token
             ).serving_endpoints.list()  # TODO: this is not async
         ]
 
     async def openai_completion(
         self,
         params: OpenAICompletionRequestWithExtraBody,
-    ) -> OpenAICompletion:
+    ) -> OpenAICompletion | AsyncIterator[OpenAICompletion]:
         raise NotImplementedError()

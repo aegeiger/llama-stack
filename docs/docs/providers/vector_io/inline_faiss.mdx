@@ -95,7 +95,9 @@ more details about Faiss in general.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `persistence` | `<class 'llama_stack.core.storage.datatypes.KVStoreReference'>` | No |  |  |
+| `persistence` | `KVStoreReference` | No |  |  |
+| `persistence.namespace` | `str` | No |  | Key prefix for KVStore backends |
+| `persistence.backend` | `str` | No |  | Name of backend from storage.backends |
 
 ## Sample Configuration
 

@@ -4,42 +4,47 @@
 # This source code is licensed under the terms described in the LICENSE file in
 # the root directory of this source tree.
 
-from __future__ import annotations
-
 import uuid
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Annotated, Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
-from fastapi import Depends, File, Form, Response, UploadFile
+from fastapi import Response, UploadFile
 
 if TYPE_CHECKING:
     from mypy_boto3_s3.client import S3Client
 
-from llama_stack.apis.common.errors import ResourceNotFoundError
-from llama_stack.apis.common.responses import Order
-from llama_stack.apis.files import (
+from llama_stack.core.access_control.datatypes import Action
+from llama_stack.core.datatypes import AccessRule
+from llama_stack.core.id_generation import generate_object_id
+from llama_stack.core.storage.sqlstore.authorized_sqlstore import AuthorizedSqlStore
+from llama_stack.core.storage.sqlstore.sqlstore import sqlstore_impl
+from llama_stack_api import (
     ExpiresAfter,
     Files,
     ListOpenAIFileResponse,
     OpenAIFileDeleteResponse,
     OpenAIFileObject,
     OpenAIFilePurpose,
+    Order,
+    ResourceNotFoundError,
 )
-from llama_stack.core.datatypes import AccessRule
-from llama_stack.core.id_generation import generate_object_id
-from llama_stack.providers.utils.files.form_data import parse_expires_after
-from llama_stack.providers.utils.sqlstore.api import ColumnDefinition, ColumnType
-from llama_stack.providers.utils.sqlstore.authorized_sqlstore import AuthorizedSqlStore
-from llama_stack.providers.utils.sqlstore.sqlstore import sqlstore_impl
+from llama_stack_api.files.models import (
+    DeleteFileRequest,
+    ListFilesRequest,
+    RetrieveFileContentRequest,
+    RetrieveFileRequest,
+    UploadFileRequest,
+)
+from llama_stack_api.internal.sqlstore import ColumnDefinition, ColumnType
 
 from .config import S3FilesImplConfig
 
 # TODO: provider data for S3 credentials
 
 
-def _create_s3_client(config: S3FilesImplConfig) -> S3Client:
+def _create_s3_client(config: S3FilesImplConfig) -> "S3Client":
     try:
         s3_config = {
             "region_name": config.region,
@@ -52,8 +57,8 @@ def _create_s3_client(config: S3FilesImplConfig) -> S3Client:
         if config.aws_access_key_id and config.aws_secret_access_key:
             s3_config.update(
                 {
-                    "aws_access_key_id": config.aws_access_key_id,
-                    "aws_secret_access_key": config.aws_secret_access_key,
+                    "aws_access_key_id": config.aws_access_key_id.get_secret_value(),
+                    "aws_secret_access_key": config.aws_secret_access_key.get_secret_value(),
                 }
             )
 
@@ -66,7 +71,7 @@ def _create_s3_client(config: S3FilesImplConfig) -> S3Client:
         raise RuntimeError(f"Failed to initialize S3 client: {e}") from e
 
 
-async def _create_bucket_if_not_exists(client: S3Client, config: S3FilesImplConfig) -> None:
+async def _create_bucket_if_not_exists(client: "S3Client", config: S3FilesImplConfig) -> None:
     try:
         client.head_bucket(Bucket=config.bucket_name)
     except ClientError as e:
@@ -143,11 +148,13 @@ class S3FilesImpl(Files):
         """Return current UTC timestamp as int seconds."""
         return int(datetime.now(UTC).timestamp())
 
-    async def _get_file(self, file_id: str, return_expired: bool = False) -> dict[str, Any]:
+    async def _get_file(
+        self, file_id: str, return_expired: bool = False, action: Action = Action.READ
+    ) -> dict[str, Any]:
         where: dict[str, str | dict] = {"id": file_id}
         if not return_expired:
             where["expires_at"] = {">": self._now()}
-        if not (row := await self.sql_store.fetch_one("openai_files", where=where)):
+        if not (row := await self.sql_store.fetch_one("openai_files", where=where, action=action)):
             raise ResourceNotFoundError(file_id, "File", "files.list()")
         return row
 
@@ -192,7 +199,7 @@ class S3FilesImpl(Files):
         pass
 
     @property
-    def client(self) -> S3Client:
+    def client(self) -> "S3Client":
         assert self._client is not None, "Provider not initialized"
         return self._client
 
@@ -203,10 +210,12 @@ class S3FilesImpl(Files):
 
     async def openai_upload_file(
         self,
-        file: Annotated[UploadFile, File()],
-        purpose: Annotated[OpenAIFilePurpose, Form()],
-        expires_after: Annotated[ExpiresAfter | None, Depends(parse_expires_after)] = None,
+        request: UploadFileRequest,
+        file: UploadFile,
     ) -> OpenAIFileObject:
+        purpose = request.purpose
+        expires_after = request.expires_after
+
         file_id = generate_object_id("file", lambda: f"file-{uuid.uuid4().hex}")
 
         filename = getattr(file, "filename", None) or "uploaded_file"
@@ -254,11 +263,13 @@ class S3FilesImpl(Files):
 
     async def openai_list_files(
         self,
-        after: str | None = None,
-        limit: int | None = 10000,
-        order: Order | None = Order.desc,
-        purpose: OpenAIFilePurpose | None = None,
+        request: ListFilesRequest,
     ) -> ListOpenAIFileResponse:
+        after = request.after
+        limit = request.limit
+        order = request.order
+        purpose = request.purpose
+
         # this purely defensive. it should not happen because the router also default to Order.desc.
         if not order:
             order = Order.desc
@@ -285,18 +296,21 @@ class S3FilesImpl(Files):
             last_id=files[-1].id if files else "",
         )
 
-    async def openai_retrieve_file(self, file_id: str) -> OpenAIFileObject:
+    async def openai_retrieve_file(self, request: RetrieveFileRequest) -> OpenAIFileObject:
+        file_id = request.file_id
         await self._delete_if_expired(file_id)
         row = await self._get_file(file_id)
         return _make_file_object(**row)
 
-    async def openai_delete_file(self, file_id: str) -> OpenAIFileDeleteResponse:
+    async def openai_delete_file(self, request: DeleteFileRequest) -> OpenAIFileDeleteResponse:
+        file_id = request.file_id
         await self._delete_if_expired(file_id)
-        _ = await self._get_file(file_id)  # raises if not found
+        _ = await self._get_file(file_id, action=Action.DELETE)  # raises if not found
         await self._delete_file(file_id)
         return OpenAIFileDeleteResponse(id=file_id, deleted=True)
 
-    async def openai_retrieve_file_content(self, file_id: str) -> Response:
+    async def openai_retrieve_file_content(self, request: RetrieveFileContentRequest) -> Response:
+        file_id = request.file_id
         await self._delete_if_expired(file_id)
 
         row = await self._get_file(file_id)

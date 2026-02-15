@@ -14,7 +14,9 @@ Local filesystem-based dataset I/O provider for reading and writing datasets to 
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `kvstore` | `<class 'llama_stack.core.storage.datatypes.KVStoreReference'>` | No |  |  |
+| `kvstore` | `KVStoreReference` | No |  |  |
+| `kvstore.namespace` | `str` | No |  | Key prefix for KVStore backends |
+| `kvstore.backend` | `str` | No |  | Name of backend from storage.backends |
 
 ## Sample Configuration
 

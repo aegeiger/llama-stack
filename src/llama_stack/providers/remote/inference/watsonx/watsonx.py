@@ -10,23 +10,21 @@ from typing import Any
 import litellm
 import requests
 
-from llama_stack.apis.inference.inference import (
+from llama_stack.log import get_logger
+from llama_stack.providers.remote.inference.watsonx.config import WatsonXConfig
+from llama_stack.providers.utils.inference.litellm_openai_mixin import LiteLLMOpenAIMixin
+from llama_stack_api import (
+    Model,
+    ModelType,
     OpenAIChatCompletion,
     OpenAIChatCompletionChunk,
     OpenAIChatCompletionRequestWithExtraBody,
     OpenAIChatCompletionUsage,
-    OpenAICompletion,
     OpenAICompletionRequestWithExtraBody,
     OpenAIEmbeddingsRequestWithExtraBody,
     OpenAIEmbeddingsResponse,
+    validate_embeddings_input_is_text,
 )
-from llama_stack.apis.models import Model
-from llama_stack.apis.models.models import ModelType
-from llama_stack.core.telemetry.tracing import get_current_span
-from llama_stack.log import get_logger
-from llama_stack.providers.remote.inference.watsonx.config import WatsonXConfig
-from llama_stack.providers.utils.inference.litellm_openai_mixin import LiteLLMOpenAIMixin
-from llama_stack.providers.utils.inference.openai_compat import prepare_openai_completion_params
 
 logger = get_logger(name=__name__, category="providers::remote::watsonx")
 
@@ -48,57 +46,25 @@ class WatsonXInferenceAdapter(LiteLLMOpenAIMixin):
             openai_compat_api_base=self.get_base_url(),
         )
 
+    def _litellm_extra_request_params(
+        self,
+        params: OpenAIChatCompletionRequestWithExtraBody | OpenAICompletionRequestWithExtraBody,
+    ) -> dict[str, Any]:
+        # These are watsonx-specific parameters used by LiteLLM.
+        return {"timeout": self.config.timeout, "project_id": self.config.project_id}
+
     async def openai_chat_completion(
         self,
         params: OpenAIChatCompletionRequestWithExtraBody,
     ) -> OpenAIChatCompletion | AsyncIterator[OpenAIChatCompletionChunk]:
         """
-        Override parent method to add timeout and inject usage object when missing.
+        Override parent method to inject usage object when missing.
+
         This works around a LiteLLM defect where usage block is sometimes dropped.
+        Note: request parameter construction (including telemetry-driven stream_options injection)
+        is handled by LiteLLMOpenAIMixin via _litellm_extra_request_params().
         """
-
-        # Add usage tracking for streaming when telemetry is active
-        stream_options = params.stream_options
-        if params.stream and get_current_span() is not None:
-            if stream_options is None:
-                stream_options = {"include_usage": True}
-            elif "include_usage" not in stream_options:
-                stream_options = {**stream_options, "include_usage": True}
-
-        model_obj = await self.model_store.get_model(params.model)
-
-        request_params = await prepare_openai_completion_params(
-            model=self.get_litellm_model_name(model_obj.provider_resource_id),
-            messages=params.messages,
-            frequency_penalty=params.frequency_penalty,
-            function_call=params.function_call,
-            functions=params.functions,
-            logit_bias=params.logit_bias,
-            logprobs=params.logprobs,
-            max_completion_tokens=params.max_completion_tokens,
-            max_tokens=params.max_tokens,
-            n=params.n,
-            parallel_tool_calls=params.parallel_tool_calls,
-            presence_penalty=params.presence_penalty,
-            response_format=params.response_format,
-            seed=params.seed,
-            stop=params.stop,
-            stream=params.stream,
-            stream_options=stream_options,
-            temperature=params.temperature,
-            tool_choice=params.tool_choice,
-            tools=params.tools,
-            top_logprobs=params.top_logprobs,
-            top_p=params.top_p,
-            user=params.user,
-            api_key=self.get_api_key(),
-            api_base=self.api_base,
-            # These are watsonx-specific parameters
-            timeout=self.config.timeout,
-            project_id=self.config.project_id,
-        )
-
-        result = await litellm.acompletion(**request_params)
+        result = await super().openai_chat_completion(params)
 
         # If not streaming, check and inject usage if missing
         if not params.stream:
@@ -175,44 +141,6 @@ class WatsonXInferenceAdapter(LiteLLMOpenAIMixin):
             logger.error(f"Error normalizing stream: {e}", exc_info=True)
             raise
 
-    async def openai_completion(
-        self,
-        params: OpenAICompletionRequestWithExtraBody,
-    ) -> OpenAICompletion:
-        """
-        Override parent method to add watsonx-specific parameters.
-        """
-        from llama_stack.providers.utils.inference.openai_compat import prepare_openai_completion_params
-
-        model_obj = await self.model_store.get_model(params.model)
-
-        request_params = await prepare_openai_completion_params(
-            model=self.get_litellm_model_name(model_obj.provider_resource_id),
-            prompt=params.prompt,
-            best_of=params.best_of,
-            echo=params.echo,
-            frequency_penalty=params.frequency_penalty,
-            logit_bias=params.logit_bias,
-            logprobs=params.logprobs,
-            max_tokens=params.max_tokens,
-            n=params.n,
-            presence_penalty=params.presence_penalty,
-            seed=params.seed,
-            stop=params.stop,
-            stream=params.stream,
-            stream_options=params.stream_options,
-            temperature=params.temperature,
-            top_p=params.top_p,
-            user=params.user,
-            suffix=params.suffix,
-            api_key=self.get_api_key(),
-            api_base=self.api_base,
-            # These are watsonx-specific parameters
-            timeout=self.config.timeout,
-            project_id=self.config.project_id,
-        )
-        return await litellm.atext_completion(**request_params)
-
     async def openai_embeddings(
         self,
         params: OpenAIEmbeddingsRequestWithExtraBody,
@@ -220,6 +148,9 @@ class WatsonXInferenceAdapter(LiteLLMOpenAIMixin):
         """
         Override parent method to add watsonx-specific parameters.
         """
+        # Validate that input contains only text, not token arrays
+        validate_embeddings_input_is_text(params)
+
         model_obj = await self.model_store.get_model(params.model)
 
         # Convert input to list if it's a string
@@ -238,8 +169,8 @@ class WatsonXInferenceAdapter(LiteLLMOpenAIMixin):
         )
 
         # Convert response to OpenAI format
-        from llama_stack.apis.inference import OpenAIEmbeddingUsage
         from llama_stack.providers.utils.inference.litellm_openai_mixin import b64_encode_openai_embeddings_response
+        from llama_stack_api import OpenAIEmbeddingUsage
 
         data = b64_encode_openai_embeddings_response(response.data, params.encoding_format)
 
@@ -255,7 +186,7 @@ class WatsonXInferenceAdapter(LiteLLMOpenAIMixin):
         )
 
     def get_base_url(self) -> str:
-        return self.config.url
+        return str(self.config.base_url)
 
     # Copied from OpenAIMixin
     async def check_model_availability(self, model: str) -> bool:
@@ -283,8 +214,8 @@ class WatsonXInferenceAdapter(LiteLLMOpenAIMixin):
             # ...
             provider_resource_id = f"{self.__provider_id__}/{model_spec['model_id']}"
             if "embedding" in functions:
-                embedding_dimension = model_spec["model_limits"]["embedding_dimension"]
-                context_length = model_spec["model_limits"]["max_sequence_length"]
+                embedding_dimension = model_spec.get("model_limits", {}).get("embedding_dimension", 0)
+                context_length = model_spec.get("model_limits", {}).get("max_sequence_length", 0)
                 embedding_metadata = {
                     "embedding_dimension": embedding_dimension,
                     "context_length": context_length,
@@ -306,10 +237,6 @@ class WatsonXInferenceAdapter(LiteLLMOpenAIMixin):
                     metadata={},
                     model_type=ModelType.llm,
                 )
-                # In theory, I guess it is possible that a model could be both an embedding model and a text chat model.
-                # In that case, the cache will record the generator Model object, and the list which we return will have
-                # both the generator Model object and the text chat Model object.  That's fine because the cache is
-                # only used for check_model_availability() anyway.
                 self._model_cache[provider_resource_id] = model
                 models.append(model)
         return models
@@ -320,7 +247,7 @@ class WatsonXInferenceAdapter(LiteLLMOpenAIMixin):
         """
         Retrieves foundation model specifications from the watsonx.ai API.
         """
-        url = f"{self.config.url}/ml/v1/foundation_model_specs?version=2023-10-25"
+        url = f"{str(self.config.base_url)}/ml/v1/foundation_model_specs?version=2023-10-25"
         headers = {
             # Note that there is no authorization header.  Listing models does not require authentication.
             "Content-Type": "application/json",

@@ -10,11 +10,25 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Iterable
 from typing import Any
 
+import httpx
 from openai import AsyncOpenAI
 from pydantic import BaseModel, ConfigDict
 
-from llama_stack.apis.inference import (
+from llama_stack.core.request_headers import NeedsRequestProviderData
+from llama_stack.log import get_logger
+from llama_stack.providers.utils.inference.http_client import (
+    _build_network_client_kwargs,
+    _merge_network_config_into_client,
+)
+from llama_stack.providers.utils.inference.model_registry import RemoteInferenceProviderConfig
+from llama_stack.providers.utils.inference.openai_compat import (
+    get_stream_options_for_telemetry,
+    prepare_openai_completion_params,
+)
+from llama_stack.providers.utils.inference.prompt_adapter import localize_image_content
+from llama_stack_api import (
     Model,
+    ModelType,
     OpenAIChatCompletion,
     OpenAIChatCompletionChunk,
     OpenAIChatCompletionRequestWithExtraBody,
@@ -25,13 +39,8 @@ from llama_stack.apis.inference import (
     OpenAIEmbeddingsResponse,
     OpenAIEmbeddingUsage,
     OpenAIMessageParam,
+    validate_embeddings_input_is_text,
 )
-from llama_stack.apis.models import ModelType
-from llama_stack.core.request_headers import NeedsRequestProviderData
-from llama_stack.log import get_logger
-from llama_stack.providers.utils.inference.model_registry import RemoteInferenceProviderConfig
-from llama_stack.providers.utils.inference.openai_compat import prepare_openai_completion_params
-from llama_stack.providers.utils.inference.prompt_adapter import localize_image_content
 
 logger = get_logger(name=__name__, category="providers::utils")
 
@@ -47,6 +56,7 @@ class OpenAIMixin(NeedsRequestProviderData, ABC, BaseModel):
     The behavior of this class can be customized by child classes in the following ways:
     - overwrite_completion_id: If True, overwrites the 'id' field in OpenAI responses
     - download_images: If True, downloads images and converts to base64 for providers that require it
+    - supports_stream_options: If False, disables stream_options injection for providers that don't support it
     - embedding_model_metadata: A dictionary mapping model IDs to their embedding metadata
     - construct_model_from_identifier: Method to construct a Model instance corresponding to the given identifier
     - provider_data_api_key_field: Optional field name in provider data to look for API key
@@ -74,6 +84,14 @@ class OpenAIMixin(NeedsRequestProviderData, ABC, BaseModel):
     # for providers that require base64 encoded images instead of URLs.
     download_images: bool = False
 
+    # Allow subclasses to control whether the provider supports stream_options parameter
+    # Set to False for providers that don't support stream_options (e.g., Ollama, vLLM)
+    supports_stream_options: bool = True
+
+    # Allow subclasses to control whether the provider supports tokenized embeddings input
+    # Set to True for providers that support pre-tokenized input (list[int] and list[list[int]])
+    supports_tokenized_embeddings_input: bool = False
+
     # Embedding model metadata for this provider
     # Can be set by subclasses or instances to provide embedding models
     # Format: {"model_id": {"embedding_dimension": 1536, "context_length": 8192}}
@@ -82,9 +100,6 @@ class OpenAIMixin(NeedsRequestProviderData, ABC, BaseModel):
     # Cache of available models keyed by model ID
     # This is set in list_models() and used in check_model_availability()
     _model_cache: dict[str, Model] = {}
-
-    # List of allowed models for this provider, if empty all models allowed
-    allowed_models: list[str] = []
 
     # Optional field name in provider data to look for API key, which takes precedence
     provider_data_api_key_field: str | None = None
@@ -116,7 +131,10 @@ class OpenAIMixin(NeedsRequestProviderData, ABC, BaseModel):
         Get any extra parameters to pass to the AsyncOpenAI client.
 
         Child classes can override this method to provide additional parameters
-        such as timeout settings, proxies, etc.
+        such as custom http_client, timeout settings, proxies, etc.
+
+        Note: Network configuration from config.network is automatically applied
+        in the client property. This method is for provider-specific customizations.
 
         :return: A dictionary of extra parameters
         """
@@ -189,6 +207,7 @@ class OpenAIMixin(NeedsRequestProviderData, ABC, BaseModel):
         Uses the abstract methods get_api_key() and get_base_url() which must be
         implemented by child classes.
 
+        Network configuration from config.network is automatically applied.
         Users can also provide the API key via the provider data header, which
         is used instead of any config API key.
         """
@@ -200,10 +219,30 @@ class OpenAIMixin(NeedsRequestProviderData, ABC, BaseModel):
                 message += f' Please provide a valid API key in the provider data header, e.g. x-llamastack-provider-data: {{"{self.provider_data_api_key_field}": "<API_KEY>"}}.'
             raise ValueError(message)
 
+        extra_params = self.get_extra_client_params()
+        network_kwargs = _build_network_client_kwargs(self.config.network)
+
+        # Handle http_client creation/merging:
+        # - If get_extra_client_params() provides an http_client (e.g., OCI with custom auth),
+        #   merge network config into it. The merge behavior:
+        #   * Preserves auth from get_extra_client_params() (provider-specific auth like OCI signer)
+        #   * Preserves headers from get_extra_client_params() as base
+        #   * Applies network config (TLS, proxy, timeout, headers) on top
+        #   * Network config headers take precedence over provider headers (allows override)
+        # - Otherwise, if network config exists, create http_client from it
+        # This allows providers with custom auth to still use standard network settings
+        if "http_client" in extra_params:
+            if network_kwargs:
+                extra_params["http_client"] = _merge_network_config_into_client(
+                    extra_params["http_client"], self.config.network
+                )
+        elif network_kwargs:
+            extra_params["http_client"] = httpx.AsyncClient(**network_kwargs)
+
         return AsyncOpenAI(
             api_key=api_key,
             base_url=self.get_base_url(),
-            **self.get_extra_client_params(),
+            **extra_params,
         )
 
     def _get_api_key_from_config_or_provider_data(self) -> str | None:
@@ -215,6 +254,19 @@ class OpenAIMixin(NeedsRequestProviderData, ABC, BaseModel):
                 api_key = getattr(provider_data, self.provider_data_api_key_field)
 
         return api_key
+
+    def _validate_model_allowed(self, provider_model_id: str) -> None:
+        """
+        Validate that the model is in the allowed_models list if configured.
+
+        :param provider_model_id: The provider-specific model ID to validate
+        :raises ValueError: If the model is not in the allowed_models list
+        """
+        if self.config.allowed_models is not None and provider_model_id not in self.config.allowed_models:
+            raise ValueError(
+                f"Model '{provider_model_id}' is not in the allowed models list. "
+                f"Allowed models: {self.config.allowed_models}"
+            )
 
     async def _get_provider_model_id(self, model: str) -> str:
         """
@@ -238,32 +290,38 @@ class OpenAIMixin(NeedsRequestProviderData, ABC, BaseModel):
         return model_obj.provider_resource_id
 
     async def _maybe_overwrite_id(self, resp: Any, stream: bool | None) -> Any:
-        if not self.overwrite_completion_id:
-            return resp
-
-        new_id = f"cltsd-{uuid.uuid4()}"
         if stream:
+            new_id = f"cltsd-{uuid.uuid4()}" if self.overwrite_completion_id else None
 
             async def _gen():
                 async for chunk in resp:
-                    chunk.id = new_id
+                    if new_id:
+                        chunk.id = new_id
                     yield chunk
 
             return _gen()
         else:
-            resp.id = new_id
+            if self.overwrite_completion_id:
+                resp.id = f"cltsd-{uuid.uuid4()}"
             return resp
 
     async def openai_completion(
         self,
         params: OpenAICompletionRequestWithExtraBody,
-    ) -> OpenAICompletion:
+    ) -> OpenAICompletion | AsyncIterator[OpenAICompletion]:
         """
         Direct OpenAI completion API call.
         """
-        # TODO: fix openai_completion to return type compatible with OpenAI's API response
+        # Inject stream_options when streaming and telemetry is active
+        stream_options = get_stream_options_for_telemetry(
+            params.stream_options, params.stream or False, self.supports_stream_options
+        )
+
+        provider_model_id = await self._get_provider_model_id(params.model)
+        self._validate_model_allowed(provider_model_id)
+
         completion_kwargs = await prepare_openai_completion_params(
-            model=await self._get_provider_model_id(params.model),
+            model=provider_model_id,
             prompt=params.prompt,
             best_of=params.best_of,
             echo=params.echo,
@@ -276,7 +334,7 @@ class OpenAIMixin(NeedsRequestProviderData, ABC, BaseModel):
             seed=params.seed,
             stop=params.stop,
             stream=params.stream,
-            stream_options=params.stream_options,
+            stream_options=stream_options,
             temperature=params.temperature,
             top_p=params.top_p,
             user=params.user,
@@ -295,6 +353,14 @@ class OpenAIMixin(NeedsRequestProviderData, ABC, BaseModel):
         """
         Direct OpenAI chat completion API call.
         """
+        # Inject stream_options when streaming and telemetry is active
+        stream_options = get_stream_options_for_telemetry(
+            params.stream_options, params.stream or False, self.supports_stream_options
+        )
+
+        provider_model_id = await self._get_provider_model_id(params.model)
+        self._validate_model_allowed(provider_model_id)
+
         messages = params.messages
 
         if self.download_images:
@@ -316,7 +382,7 @@ class OpenAIMixin(NeedsRequestProviderData, ABC, BaseModel):
             messages = [await _localize_image_url(m) for m in messages]
 
         request_params = await prepare_openai_completion_params(
-            model=await self._get_provider_model_id(params.model),
+            model=provider_model_id,
             messages=messages,
             frequency_penalty=params.frequency_penalty,
             function_call=params.function_call,
@@ -332,13 +398,16 @@ class OpenAIMixin(NeedsRequestProviderData, ABC, BaseModel):
             seed=params.seed,
             stop=params.stop,
             stream=params.stream,
-            stream_options=params.stream_options,
+            stream_options=stream_options,
             temperature=params.temperature,
             tool_choice=params.tool_choice,
             tools=params.tools,
             top_logprobs=params.top_logprobs,
             top_p=params.top_p,
             user=params.user,
+            safety_identifier=params.safety_identifier,
+            reasoning_effort=params.reasoning_effort,
+            prompt_cache_key=params.prompt_cache_key,
         )
 
         if extra_body := params.model_extra:
@@ -354,10 +423,17 @@ class OpenAIMixin(NeedsRequestProviderData, ABC, BaseModel):
         """
         Direct OpenAI embeddings API call.
         """
+        # Validate token array support if provider doesn't support it
+        if not self.supports_tokenized_embeddings_input:
+            validate_embeddings_input_is_text(params)
+
+        provider_model_id = await self._get_provider_model_id(params.model)
+        self._validate_model_allowed(provider_model_id)
+
         # Build request params conditionally to avoid NotGiven/Omit type mismatch
         # The OpenAI SDK uses Omit in signatures but NOT_GIVEN has type NotGiven
         request_params: dict[str, Any] = {
-            "model": await self._get_provider_model_id(params.model),
+            "model": provider_model_id,
             "input": params.input,
         }
         if params.encoding_format is not None:
@@ -441,7 +517,7 @@ class OpenAIMixin(NeedsRequestProviderData, ABC, BaseModel):
         for provider_model_id in provider_models_ids:
             if not isinstance(provider_model_id, str):
                 raise ValueError(f"Model ID {provider_model_id} from list_provider_model_ids() is not a string")
-            if self.allowed_models and provider_model_id not in self.allowed_models:
+            if self.config.allowed_models is not None and provider_model_id not in self.config.allowed_models:
                 logger.info(f"Skipping model {provider_model_id} as it is not in the allowed models list")
                 continue
             model = self.construct_model_from_identifier(provider_model_id)

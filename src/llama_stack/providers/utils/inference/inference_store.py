@@ -8,20 +8,19 @@ from typing import Any
 
 from sqlalchemy.exc import IntegrityError
 
-from llama_stack.apis.inference import (
+from llama_stack.core.datatypes import AccessRule
+from llama_stack.core.storage.datatypes import InferenceStoreReference, StorageBackendType
+from llama_stack.core.storage.sqlstore.authorized_sqlstore import AuthorizedSqlStore
+from llama_stack.core.storage.sqlstore.sqlstore import _SQLSTORE_BACKENDS, sqlstore_impl
+from llama_stack.log import get_logger
+from llama_stack_api import (
     ListOpenAIChatCompletionResponse,
     OpenAIChatCompletion,
     OpenAICompletionWithInputMessages,
     OpenAIMessageParam,
     Order,
 )
-from llama_stack.core.datatypes import AccessRule
-from llama_stack.core.storage.datatypes import InferenceStoreReference, StorageBackendType
-from llama_stack.log import get_logger
-
-from ..sqlstore.api import ColumnDefinition, ColumnType
-from ..sqlstore.authorized_sqlstore import AuthorizedSqlStore
-from ..sqlstore.sqlstore import _SQLSTORE_BACKENDS, sqlstore_impl
+from llama_stack_api.internal.sqlstore import ColumnDefinition, ColumnType
 
 logger = get_logger(name=__name__, category="inference")
 
@@ -35,6 +34,7 @@ class InferenceStore:
         self.reference = reference
         self.sql_store = None
         self.policy = policy
+        self.enable_write_queue = True
 
         # Async write queue and worker control
         self._queue: asyncio.Queue[tuple[OpenAIChatCompletion, list[OpenAIMessageParam]]] | None = None
@@ -47,16 +47,15 @@ class InferenceStore:
         base_store = sqlstore_impl(self.reference)
         self.sql_store = AuthorizedSqlStore(base_store, self.policy)
 
-        # Disable write queue for SQLite to avoid concurrency issues
-        backend_name = self.reference.backend
-        backend_config = _SQLSTORE_BACKENDS.get(backend_name)
-        if backend_config is None:
-            raise ValueError(
-                f"Unregistered SQL backend '{backend_name}'. Registered backends: {sorted(_SQLSTORE_BACKENDS)}"
-            )
-        self.enable_write_queue = backend_config.type != StorageBackendType.SQL_SQLITE
+        # Disable write queue for SQLite since WAL mode handles concurrency
+        # Keep it enabled for other backends (like Postgres) for performance
+        backend_config = _SQLSTORE_BACKENDS.get(self.reference.backend)
+        if backend_config and backend_config.type == StorageBackendType.SQL_SQLITE:
+            self.enable_write_queue = False
+            logger.debug("Write queue disabled for SQLite (WAL mode handles concurrency)")
+
         await self.sql_store.create_table(
-            "chat_completions",
+            self.reference.table_name,
             {
                 "id": ColumnDefinition(type=ColumnType.STRING, primary_key=True),
                 "created": ColumnType.INTEGER,
@@ -65,13 +64,6 @@ class InferenceStore:
                 "input_messages": ColumnType.JSON,
             },
         )
-
-        if self.enable_write_queue:
-            self._queue = asyncio.Queue(maxsize=self._max_write_queue_size)
-            for _ in range(self._num_writers):
-                self._worker_tasks.append(asyncio.create_task(self._worker_loop()))
-        else:
-            logger.info("Write queue disabled for SQLite to avoid concurrency issues")
 
     async def shutdown(self) -> None:
         if not self._worker_tasks:
@@ -93,10 +85,29 @@ class InferenceStore:
         if self.enable_write_queue and self._queue is not None:
             await self._queue.join()
 
+    async def _ensure_workers_started(self) -> None:
+        """Ensure the async write queue workers run on the current loop."""
+        if not self.enable_write_queue:
+            return
+
+        if self._queue is None:
+            self._queue = asyncio.Queue(maxsize=self._max_write_queue_size)
+            logger.debug(
+                f"Inference store write queue created with max size {self._max_write_queue_size} "
+                f"and {self._num_writers} writers"
+            )
+
+        if not self._worker_tasks:
+            loop = asyncio.get_running_loop()
+            for _ in range(self._num_writers):
+                task = loop.create_task(self._worker_loop())
+                self._worker_tasks.append(task)
+
     async def store_chat_completion(
         self, chat_completion: OpenAIChatCompletion, input_messages: list[OpenAIMessageParam]
     ) -> None:
         if self.enable_write_queue:
+            await self._ensure_workers_started()
             if self._queue is None:
                 raise ValueError("Inference store is not initialized")
             try:
@@ -141,7 +152,7 @@ class InferenceStore:
 
         try:
             await self.sql_store.insert(
-                table="chat_completions",
+                table=self.reference.table_name,
                 data=record_data,
             )
         except IntegrityError as e:
@@ -153,7 +164,7 @@ class InferenceStore:
             error_message = str(e.orig) if e.orig else str(e)
             if self._is_unique_constraint_error(error_message):
                 # Update the existing record instead
-                await self.sql_store.update(table="chat_completions", data=record_data, where={"id": data["id"]})
+                await self.sql_store.update(table=self.reference.table_name, data=record_data, where={"id": data["id"]})
             else:
                 # Re-raise if it's not a unique constraint error
                 raise
@@ -197,7 +208,7 @@ class InferenceStore:
             where_conditions["model"] = model
 
         paginated_result = await self.sql_store.fetch_all(
-            table="chat_completions",
+            table=self.reference.table_name,
             where=where_conditions if where_conditions else None,
             order_by=[("created", order.value)],
             cursor=("id", after) if after else None,
@@ -226,7 +237,7 @@ class InferenceStore:
             raise ValueError("Inference store is not initialized")
 
         row = await self.sql_store.fetch_one(
-            table="chat_completions",
+            table=self.reference.table_name,
             where={"id": completion_id},
         )
 

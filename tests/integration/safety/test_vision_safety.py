@@ -10,7 +10,7 @@ import os
 
 import pytest
 
-from llama_stack.apis.safety import ViolationLevel
+from llama_stack_api import ViolationLevel
 
 VISION_SHIELD_ENABLED_PROVIDERS = {"together"}
 
@@ -58,7 +58,6 @@ def test_safety_with_image(llama_stack_client, model_providers):
         response = llama_stack_client.safety.run_shield(
             messages=[message],
             shield_id="meta-llama/Llama-Guard-3-11B-Vision",
-            params={},
         )
         assert response is not None
 

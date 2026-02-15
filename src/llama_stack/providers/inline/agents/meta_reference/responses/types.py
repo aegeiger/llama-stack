@@ -10,9 +10,14 @@ from typing import cast
 from openai.types.chat import ChatCompletionToolParam
 from pydantic import BaseModel
 
-from llama_stack.apis.agents.openai_responses import (
+from llama_stack_api import (
+    OpenAIChatCompletionToolCall,
+    OpenAIFinishReason,
+    OpenAIMessageParam,
+    OpenAIResponseFormatParam,
     OpenAIResponseInput,
     OpenAIResponseInputTool,
+    OpenAIResponseInputToolChoice,
     OpenAIResponseInputToolFileSearch,
     OpenAIResponseInputToolFunction,
     OpenAIResponseInputToolMCP,
@@ -25,8 +30,8 @@ from llama_stack.apis.agents.openai_responses import (
     OpenAIResponseOutputMessageMCPListTools,
     OpenAIResponseTool,
     OpenAIResponseToolMCP,
+    OpenAITokenLogProb,
 )
-from llama_stack.apis.inference import OpenAIChatCompletionToolCall, OpenAIMessageParam, OpenAIResponseFormatParam
 
 
 class ToolExecutionResult(BaseModel):
@@ -48,10 +53,11 @@ class ChatCompletionResult:
     tool_calls: dict[int, OpenAIChatCompletionToolCall]
     created: int
     model: str
-    finish_reason: str
+    finish_reason: OpenAIFinishReason
     message_item_id: str  # For streaming events
     tool_call_item_ids: dict[int, str]  # For streaming events
     content_part_emitted: bool  # Tracking state
+    logprobs: list[OpenAITokenLogProb] | None = None
 
     @property
     def content_text(self) -> str:
@@ -158,6 +164,7 @@ class ChatCompletionContext(BaseModel):
     temperature: float | None
     response_format: OpenAIResponseFormatParam
     tool_context: ToolContext | None
+    tool_choice: OpenAIResponseInputToolChoice | None = None
     approval_requests: list[OpenAIResponseMCPApprovalRequest] = []
     approval_responses: dict[str, OpenAIResponseMCPApprovalResponse] = {}
 
@@ -170,6 +177,7 @@ class ChatCompletionContext(BaseModel):
         response_format: OpenAIResponseFormatParam,
         tool_context: ToolContext,
         inputs: list[OpenAIResponseInput] | str,
+        tool_choice: OpenAIResponseInputToolChoice | None = None,
     ):
         super().__init__(
             model=model,
@@ -178,6 +186,7 @@ class ChatCompletionContext(BaseModel):
             temperature=temperature,
             response_format=response_format,
             tool_context=tool_context,
+            tool_choice=tool_choice,
         )
         if not isinstance(inputs, str):
             self.approval_requests = [input for input in inputs if input.type == "mcp_approval_request"]

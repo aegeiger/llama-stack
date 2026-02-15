@@ -8,16 +8,16 @@ import time
 
 import pytest
 
-from llama_stack.apis.inference import (
-    OpenAIAssistantMessageParam,
+from llama_stack.core.storage.datatypes import InferenceStoreReference, SqliteSqlStoreConfig
+from llama_stack.core.storage.sqlstore.sqlstore import register_sqlstore_backends
+from llama_stack.providers.utils.inference.inference_store import InferenceStore
+from llama_stack_api import (
     OpenAIChatCompletion,
+    OpenAIChatCompletionResponseMessage,
     OpenAIChoice,
     OpenAIUserMessageParam,
     Order,
 )
-from llama_stack.core.storage.datatypes import InferenceStoreReference, SqliteSqlStoreConfig
-from llama_stack.providers.utils.inference.inference_store import InferenceStore
-from llama_stack.providers.utils.sqlstore.sqlstore import register_sqlstore_backends
 
 
 @pytest.fixture(autouse=True)
@@ -39,7 +39,7 @@ def create_test_chat_completion(
         choices=[
             OpenAIChoice(
                 index=0,
-                message=OpenAIAssistantMessageParam(
+                message=OpenAIChatCompletionResponseMessage(
                     role="assistant",
                     content=f"Response for {completion_id}",
                 ),
@@ -210,3 +210,32 @@ async def test_inference_store_pagination_no_limit():
     assert result.data[0].id == "beta-second"  # Most recent first
     assert result.data[1].id == "omega-first"
     assert result.has_more is False
+
+
+async def test_inference_store_custom_table_name():
+    """Test that the table_name from config is respected."""
+    custom_table_name = "custom_inference_store"
+    reference = InferenceStoreReference(backend="sql_default", table_name=custom_table_name)
+    store = InferenceStore(reference, policy=[])
+    await store.initialize()
+
+    # Create and store a test chat completion
+    base_time = int(time.time())
+    completion = create_test_chat_completion("custom-table-test", base_time)
+    input_messages = [OpenAIUserMessageParam(role="user", content="Test custom table")]
+    await store.store_chat_completion(completion, input_messages)
+    await store.flush()
+
+    # Verify we can retrieve the completion
+    result = await store.get_chat_completion("custom-table-test")
+    assert result.id == "custom-table-test"
+    assert result.model == "test-model"
+
+    # Verify listing works
+    list_result = await store.list_chat_completions()
+    assert len(list_result.data) == 1
+    assert list_result.data[0].id == "custom-table-test"
+
+    # Verify the error message uses the custom table name
+    with pytest.raises(ValueError, match=f"Record with id='non-existent' not found in table '{custom_table_name}'"):
+        await store.list_chat_completions(after="non-existent", limit=2)

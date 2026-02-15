@@ -14,12 +14,13 @@ on:
     paths:
       - 'distributions/**'
       - 'src/llama_stack/**'
-      - '!src/llama_stack/ui/**'
+      - '!src/llama_stack_ui/**'
       - 'tests/integration/**'
       - 'uv.lock'
       - 'pyproject.toml'
       - 'requirements.txt'
       - '.github/workflows/integration-auth-tests.yml' # This workflow
+      - 'scripts/integration-auth-tests.sh'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
@@ -35,14 +36,14 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Install dependencies
         uses: ./.github/actions/setup-runner
 
       - name: Install minikube
         if: ${{ matrix.auth-provider == 'kubernetes' }}
-        uses: medyagh/setup-minikube@e3c7f79eb1e997eabccc536a6cf318a2b0fe19d9 # v0.0.20
+        uses: medyagh/setup-minikube@e9e035a86bbc3caea26a450bd4dbf9d0c453682e # v0.0.21
 
       - name: Start minikube
         if: ${{ matrix.auth-provider == 'oauth2_token' }}
@@ -54,8 +55,10 @@ jobs:
         if: ${{ matrix.auth-provider == 'oauth2_token' }}
         run: |
           kubectl create namespace llama-stack
-          kubectl create serviceaccount llama-stack-auth -n llama-stack
-          kubectl create token llama-stack-auth -n llama-stack > llama-stack-auth-token
+          for account in llama-stack-auth llama-stack-user1 llama-stack-user2; do
+            kubectl create serviceaccount $account -n llama-stack
+            kubectl create token $account -n llama-stack > $account-token
+          done
 
       - name: Set Kubernetes Config
         if: ${{ matrix.auth-provider == 'oauth2_token' }}
@@ -72,11 +75,22 @@ jobs:
         if: ${{ matrix.auth-provider == 'oauth2_token' }}
         run: |
           run_dir=$(mktemp -d)
-          cat <<'EOF' > $run_dir/run.yaml
+          cat <<EOF > $run_dir/config.yaml
           version: '2'
           image_name: kube
-          apis: []
-          providers: {}
+          distro_name: kube
+          apis:
+            - files
+            - inference
+          providers:
+            files:
+              - provider_id: meta-reference-files
+                provider_type: inline::localfs
+                config:
+                  storage_dir: $run_dir/files
+                  metadata_store:
+                    table_name: files_metadata
+                    backend: sql_default
           storage:
             backends:
               kv_default:
@@ -100,18 +114,33 @@ jobs:
                 backend: kv_default
           server:
             port: 8321
+            auth:
+              access_policy:
+                - permit:
+                    actions: [read, delete]
+                    resource: sql_record::openai_files::*
+                  when:
+                    - user with system:serviceaccount:llama-stack:llama-stack-user1 in roles
+                    - user in owners roles
+                  description: User1 can read and delete their Files
+                - permit:
+                    actions: [read]
+                    resource: sql_record::openai_files::*
+                  when:
+                    - user in owners roles
+                  description: Owners can read their Files
           EOF
-          yq eval '.server.auth.provider_config.type = "${{ matrix.auth-provider }}"' -i $run_dir/run.yaml
-          yq eval '.server.auth.provider_config.tls_cafile = "${{ env.KUBERNETES_CA_CERT_PATH }}"' -i $run_dir/run.yaml
-          yq eval '.server.auth.provider_config.issuer = "${{ env.KUBERNETES_ISSUER }}"' -i $run_dir/run.yaml
-          yq eval '.server.auth.provider_config.audience = "${{ env.KUBERNETES_AUDIENCE }}"' -i $run_dir/run.yaml
-          yq eval '.server.auth.provider_config.jwks.uri = "${{ env.KUBERNETES_API_SERVER_URL }}"' -i $run_dir/run.yaml
-          yq eval '.server.auth.provider_config.jwks.token = "${{ env.TOKEN }}"' -i $run_dir/run.yaml
-          cat $run_dir/run.yaml
+          yq eval '.server.auth.provider_config.type = "${{ matrix.auth-provider }}"' -i $run_dir/config.yaml
+          yq eval '.server.auth.provider_config.tls_cafile = "${{ env.KUBERNETES_CA_CERT_PATH }}"' -i $run_dir/config.yaml
+          yq eval '.server.auth.provider_config.issuer = "${{ env.KUBERNETES_ISSUER }}"' -i $run_dir/config.yaml
+          yq eval '.server.auth.provider_config.audience = "${{ env.KUBERNETES_AUDIENCE }}"' -i $run_dir/config.yaml
+          yq eval '.server.auth.provider_config.jwks.uri = "${{ env.KUBERNETES_API_SERVER_URL }}"' -i $run_dir/config.yaml
+          yq eval '.server.auth.provider_config.jwks.token = "${{ env.TOKEN }}"' -i $run_dir/config.yaml
+          cat $run_dir/config.yaml
 
           # avoid line breaks in the server log, especially because we grep it below.
           export LLAMA_STACK_LOG_WIDTH=200
-          nohup uv run llama stack run $run_dir/run.yaml > server.log 2>&1 &
+          nohup uv run llama stack run $run_dir/config.yaml > server.log 2>&1 &
 
       - name: Wait for Llama Stack server to be ready
         run: |
@@ -137,27 +166,5 @@ jobs:
 
       - name: Test auth
         run: |
-          echo "Testing /v1/version without token (should succeed)..."
-          if curl -s -L -o /dev/null -w "%{http_code}" http://127.0.0.1:8321/v1/version | grep -q "200"; then
-            echo "/v1/version accessible without token (200)"
-          else
-            echo "/v1/version returned non-200 status without token"
-            exit 1
-          fi
-
-          echo "Testing /v1/providers without token (should fail with 401)..."
-          if curl -s -L -o /dev/null -w "%{http_code}" http://127.0.0.1:8321/v1/providers | grep -q "401"; then
-            echo "/v1/providers blocked without token (401)"
-          else
-            echo "/v1/providers did not return 401 without token"
-            exit 1
-          fi
-
-          echo "Testing /v1/providers with valid token (should succeed)..."
-          curl -s -L -H "Authorization: Bearer $(cat llama-stack-auth-token)" http://127.0.0.1:8321/v1/providers | jq
-          if [ $? -eq 0 ]; then
-            echo "/v1/providers accessible with valid token"
-          else
-            echo "/v1/providers failed with valid token"
-            exit 1
-          fi
+          # Run the auth tests
+          ./scripts/integration-auth-tests.sh

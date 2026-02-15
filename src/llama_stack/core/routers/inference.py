@@ -7,7 +7,6 @@
 import asyncio
 import time
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
 from typing import Annotated, Any
 
 from fastapi import Body
@@ -15,14 +14,25 @@ from openai.types.chat import ChatCompletionToolChoiceOptionParam as OpenAIChatC
 from openai.types.chat import ChatCompletionToolParam as OpenAIChatCompletionToolParam
 from pydantic import TypeAdapter
 
-from llama_stack.apis.common.errors import ModelNotFoundError, ModelTypeError
-from llama_stack.apis.inference import (
+from llama_stack.core.access_control.access_control import is_action_allowed
+from llama_stack.core.datatypes import ModelWithOwner
+from llama_stack.core.request_headers import get_authenticated_user
+from llama_stack.log import get_logger
+from llama_stack.providers.utils.inference.inference_store import InferenceStore
+from llama_stack_api import (
+    GetChatCompletionRequest,
+    HealthResponse,
+    HealthStatus,
     Inference,
+    ListChatCompletionsRequest,
     ListOpenAIChatCompletionResponse,
-    OpenAIAssistantMessageParam,
+    ModelNotFoundError,
+    ModelType,
+    ModelTypeError,
     OpenAIChatCompletion,
     OpenAIChatCompletionChunk,
     OpenAIChatCompletionRequestWithExtraBody,
+    OpenAIChatCompletionResponseMessage,
     OpenAIChatCompletionToolCall,
     OpenAIChatCompletionToolCallFunction,
     OpenAIChoice,
@@ -33,21 +43,13 @@ from llama_stack.apis.inference import (
     OpenAIEmbeddingsRequestWithExtraBody,
     OpenAIEmbeddingsResponse,
     OpenAIMessageParam,
-    Order,
+    OpenAITokenLogProb,
+    OpenAITopLogProb,
+    RegisterModelRequest,
     RerankResponse,
+    RoutingTable,
 )
-from llama_stack.apis.inference.inference import (
-    OpenAIChatCompletionContentPartImageParam,
-    OpenAIChatCompletionContentPartTextParam,
-)
-from llama_stack.apis.models import ModelType
-from llama_stack.core.telemetry.telemetry import MetricEvent
-from llama_stack.core.telemetry.tracing import enqueue_event, get_current_span
-from llama_stack.log import get_logger
-from llama_stack.models.llama.llama3.chat_format import ChatFormat
-from llama_stack.models.llama.llama3.tokenizer import Tokenizer
-from llama_stack.providers.datatypes import HealthResponse, HealthStatus, RoutingTable
-from llama_stack.providers.utils.inference.inference_store import InferenceStore
+from llama_stack_api.inference.models import RerankRequest
 
 logger = get_logger(name=__name__, category="core::routers")
 
@@ -59,15 +61,10 @@ class InferenceRouter(Inference):
         self,
         routing_table: RoutingTable,
         store: InferenceStore | None = None,
-        telemetry_enabled: bool = False,
     ) -> None:
         logger.debug("Initializing InferenceRouter")
         self.routing_table = routing_table
-        self.telemetry_enabled = telemetry_enabled
         self.store = store
-        if self.telemetry_enabled:
-            self.tokenizer = Tokenizer.get_instance()
-            self.formatter = ChatFormat(self.tokenizer)
 
     async def initialize(self) -> None:
         logger.debug("InferenceRouter.initialize")
@@ -91,55 +88,14 @@ class InferenceRouter(Inference):
         logger.debug(
             f"InferenceRouter.register_model: {model_id=} {provider_model_id=} {provider_id=} {metadata=} {model_type=}",
         )
-        await self.routing_table.register_model(model_id, provider_model_id, provider_id, metadata, model_type)
-
-    def _construct_metrics(
-        self,
-        prompt_tokens: int,
-        completion_tokens: int,
-        total_tokens: int,
-        fully_qualified_model_id: str,
-        provider_id: str,
-    ) -> list[MetricEvent]:
-        """Constructs a list of MetricEvent objects containing token usage metrics.
-
-        Args:
-            prompt_tokens: Number of tokens in the prompt
-            completion_tokens: Number of tokens in the completion
-            total_tokens: Total number of tokens used
-            fully_qualified_model_id:
-            provider_id: The provider identifier
-
-        Returns:
-            List of MetricEvent objects with token usage metrics
-        """
-        span = get_current_span()
-        if span is None:
-            logger.warning("No span found for token usage metrics")
-            return []
-
-        metrics = [
-            ("prompt_tokens", prompt_tokens),
-            ("completion_tokens", completion_tokens),
-            ("total_tokens", total_tokens),
-        ]
-        metric_events = []
-        for metric_name, value in metrics:
-            metric_events.append(
-                MetricEvent(
-                    trace_id=span.trace_id,
-                    span_id=span.span_id,
-                    metric=metric_name,
-                    value=value,
-                    timestamp=datetime.now(UTC),
-                    unit="tokens",
-                    attributes={
-                        "model_id": fully_qualified_model_id,
-                        "provider_id": provider_id,
-                    },
-                )
-            )
-        return metric_events
+        request = RegisterModelRequest(
+            model_id=model_id,
+            provider_model_id=provider_model_id,
+            provider_id=provider_id,
+            metadata=metadata,
+            model_type=model_type,
+        )
+        await self.routing_table.register_model(request)
 
     async def _get_model_provider(self, model_id: str, expected_model_type: str) -> tuple[Inference, str]:
         model = await self.routing_table.get_object_by_identifier("model", model_id)
@@ -150,27 +106,50 @@ class InferenceRouter(Inference):
             provider = await self.routing_table.get_provider_impl(model.identifier)
             return provider, model.provider_resource_id
 
+        # Handles cases where clients use the provider format directly
+        return await self._get_provider_by_fallback(model_id, expected_model_type)
+
+    async def _get_provider_by_fallback(self, model_id: str, expected_model_type: str) -> tuple[Inference, str]:
+        """
+        Handle fallback case where model_id is in provider_id/provider_resource_id format.
+        """
         splits = model_id.split("/", maxsplit=1)
         if len(splits) != 2:
             raise ModelNotFoundError(model_id)
 
         provider_id, provider_resource_id = splits
+
+        # Check if provider exists
         if provider_id not in self.routing_table.impls_by_provider_id:
             logger.warning(f"Provider {provider_id} not found for model {model_id}")
+            raise ModelNotFoundError(model_id)
+
+        # Create a temporary model object for RBAC check
+        temp_model = ModelWithOwner(
+            identifier=model_id,
+            provider_id=provider_id,
+            provider_resource_id=provider_resource_id,
+            model_type=expected_model_type,
+            metadata={},  # Empty metadata for temporary object
+        )
+
+        # Perform RBAC check
+        user = get_authenticated_user()
+        if not is_action_allowed(self.routing_table.policy, "read", temp_model, user):
+            logger.debug(
+                f"Access denied to model '{model_id}' via fallback path for user {user.principal if user else 'anonymous'}"
+            )
             raise ModelNotFoundError(model_id)
 
         return self.routing_table.impls_by_provider_id[provider_id], provider_resource_id
 
     async def rerank(
         self,
-        model: str,
-        query: str | OpenAIChatCompletionContentPartTextParam | OpenAIChatCompletionContentPartImageParam,
-        items: list[str | OpenAIChatCompletionContentPartTextParam | OpenAIChatCompletionContentPartImageParam],
-        max_num_results: int | None = None,
+        params: RerankRequest,
     ) -> RerankResponse:
-        logger.debug(f"InferenceRouter.rerank: {model}")
-        provider, provider_resource_id = await self._get_model_provider(model, ModelType.rerank)
-        return await provider.rerank(provider_resource_id, query, items, max_num_results)
+        provider, provider_resource_id = await self._get_model_provider(params.model, ModelType.rerank)
+        params.model = provider_resource_id
+        return await provider.rerank(params)
 
     async def openai_completion(
         self,
@@ -185,26 +164,9 @@ class InferenceRouter(Inference):
 
         if params.stream:
             return await provider.openai_completion(params)
-            # TODO: Metrics do NOT work with openai_completion stream=True due to the fact
-            # that we do not return an AsyncIterator, our tests expect a stream of chunks we cannot intercept currently.
 
         response = await provider.openai_completion(params)
         response.model = request_model_id
-        if self.telemetry_enabled:
-            metrics = self._construct_metrics(
-                prompt_tokens=response.usage.prompt_tokens,
-                completion_tokens=response.usage.completion_tokens,
-                total_tokens=response.usage.total_tokens,
-                fully_qualified_model_id=request_model_id,
-                provider_id=provider.__provider_id__,
-            )
-            for metric in metrics:
-                enqueue_event(metric)
-
-            # these metrics will show up in the client response.
-            response.metrics = (
-                metrics if not hasattr(response, "metrics") or response.metrics is None else response.metrics + metrics
-            )
         return response
 
     async def openai_chat_completion(
@@ -253,20 +215,6 @@ class InferenceRouter(Inference):
         if self.store:
             asyncio.create_task(self.store.store_chat_completion(response, params.messages))
 
-        if self.telemetry_enabled:
-            metrics = self._construct_metrics(
-                prompt_tokens=response.usage.prompt_tokens,
-                completion_tokens=response.usage.completion_tokens,
-                total_tokens=response.usage.total_tokens,
-                fully_qualified_model_id=request_model_id,
-                provider_id=provider.__provider_id__,
-            )
-            for metric in metrics:
-                enqueue_event(metric)
-            # these metrics will show up in the client response.
-            response.metrics = (
-                metrics if not hasattr(response, "metrics") or response.metrics is None else response.metrics + metrics
-            )
         return response
 
     async def openai_embeddings(
@@ -286,18 +234,20 @@ class InferenceRouter(Inference):
 
     async def list_chat_completions(
         self,
-        after: str | None = None,
-        limit: int | None = 20,
-        model: str | None = None,
-        order: Order | None = Order.desc,
+        request: ListChatCompletionsRequest,
     ) -> ListOpenAIChatCompletionResponse:
         if self.store:
-            return await self.store.list_chat_completions(after, limit, model, order)
+            return await self.store.list_chat_completions(
+                after=request.after,
+                limit=request.limit,
+                model=request.model,
+                order=request.order,
+            )
         raise NotImplementedError("List chat completions is not supported: inference store is not configured.")
 
-    async def get_chat_completion(self, completion_id: str) -> OpenAICompletionWithInputMessages:
+    async def get_chat_completion(self, request: GetChatCompletionRequest) -> OpenAICompletionWithInputMessages:
         if self.store:
-            return await self.store.get_chat_completion(completion_id)
+            return await self.store.get_chat_completion(request.completion_id)
         raise NotImplementedError("Get chat completion is not supported: inference store is not configured.")
 
     async def _nonstream_openai_chat_completion(
@@ -401,26 +351,40 @@ class InferenceRouter(Inference):
                                             )
                         if choice_delta.finish_reason:
                             current_choice_data["finish_reason"] = choice_delta.finish_reason
+
+                        # Convert logprobs from chat completion format to responses format
+                        # Chat completion returns list of ChatCompletionTokenLogprob, but
+                        # expecting list of OpenAITokenLogProb in OpenAIChoice
                         if choice_delta.logprobs and choice_delta.logprobs.content:
-                            current_choice_data["logprobs_content_parts"].extend(choice_delta.logprobs.content)
+                            converted_logprobs = []
+                            for token_logprob in choice_delta.logprobs.content:
+                                top_logprobs = None
+                                if token_logprob.top_logprobs:
+                                    top_logprobs = [
+                                        OpenAITopLogProb(
+                                            token=tlp.token,
+                                            bytes=tlp.bytes,
+                                            logprob=tlp.logprob,
+                                        )
+                                        for tlp in token_logprob.top_logprobs
+                                    ]
+                                converted_logprobs.append(
+                                    OpenAITokenLogProb(
+                                        token=token_logprob.token,
+                                        bytes=token_logprob.bytes,
+                                        logprob=token_logprob.logprob,
+                                        top_logprobs=top_logprobs,
+                                    )
+                                )
+                            # Update choice delta with the newly formatted logprobs object
+                            choice_delta.logprobs.content = converted_logprobs
+                            current_choice_data["logprobs_content_parts"].extend(converted_logprobs)
 
                 # Compute metrics on final chunk
                 if chunk.choices and chunk.choices[0].finish_reason:
                     completion_text = ""
                     for choice_data in choices_data.values():
                         completion_text += "".join(choice_data["content_parts"])
-
-                    # Add metrics to the chunk
-                    if self.telemetry_enabled and hasattr(chunk, "usage") and chunk.usage:
-                        metrics = self._construct_metrics(
-                            prompt_tokens=chunk.usage.prompt_tokens,
-                            completion_tokens=chunk.usage.completion_tokens,
-                            total_tokens=chunk.usage.total_tokens,
-                            model_id=fully_qualified_model_id,
-                            provider_id=provider_id,
-                        )
-                        for metric in metrics:
-                            enqueue_event(metric)
 
                 yield chunk
         finally:
@@ -444,7 +408,7 @@ class InferenceRouter(Inference):
                                         ),
                                     )
                                 )
-                    message = OpenAIAssistantMessageParam(
+                    message = OpenAIChatCompletionResponseMessage(
                         role="assistant",
                         content=content_str if content_str else None,
                         tool_calls=assembled_tool_calls if assembled_tool_calls else None,

@@ -16,6 +16,8 @@ import torch
 from datasets import Dataset
 from transformers import AutoConfig, AutoModelForCausalLM
 
+from llama_stack_api import Checkpoint, DatasetIO, IterRowsRequest, TrainingConfig
+
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
@@ -34,8 +36,6 @@ class HFAutoModel(Protocol):
     def save_pretrained(self, save_directory: str | Path) -> None: ...
 
 
-from llama_stack.apis.datasetio import DatasetIO
-from llama_stack.apis.post_training import Checkpoint, TrainingConfig
 from llama_stack.log import get_logger
 
 from .config import HuggingFacePostTrainingConfig
@@ -135,10 +135,7 @@ def setup_torch_device(device_str: str) -> torch.device:
 async def load_rows_from_dataset(datasetio_api: DatasetIO, dataset_id: str) -> list[dict[str, Any]]:
     """Load dataset from llama stack dataset provider"""
     try:
-        all_rows = await datasetio_api.iterrows(
-            dataset_id=dataset_id,
-            limit=-1,
-        )
+        all_rows = await datasetio_api.iterrows(IterRowsRequest(dataset_id=dataset_id, limit=-1))
         if not isinstance(all_rows.data, list):
             raise RuntimeError("Expected dataset data to be a list")
         return all_rows.data

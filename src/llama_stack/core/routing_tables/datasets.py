@@ -5,24 +5,26 @@
 # the root directory of this source tree.
 
 import uuid
-from typing import Any
 
-from llama_stack.apis.common.errors import DatasetNotFoundError
-from llama_stack.apis.datasets import (
-    Dataset,
-    DatasetPurpose,
-    Datasets,
-    DatasetType,
-    DataSource,
-    ListDatasetsResponse,
-    RowsDataSource,
-    URIDataSource,
-)
-from llama_stack.apis.resource import ResourceType
 from llama_stack.core.datatypes import (
     DatasetWithOwner,
 )
 from llama_stack.log import get_logger
+from llama_stack_api import (
+    Dataset,
+    DatasetNotFoundError,
+    DatasetType,
+    ListDatasetsResponse,
+    ResourceType,
+    RowsDataSource,
+    URIDataSource,
+)
+from llama_stack_api.datasets.api import (
+    Datasets,
+    GetDatasetRequest,
+    RegisterDatasetRequest,
+    UnregisterDatasetRequest,
+)
 
 from .common import CommonRoutingTableImpl
 
@@ -33,19 +35,17 @@ class DatasetsRoutingTable(CommonRoutingTableImpl, Datasets):
     async def list_datasets(self) -> ListDatasetsResponse:
         return ListDatasetsResponse(data=await self.get_all_with_type(ResourceType.dataset.value))
 
-    async def get_dataset(self, dataset_id: str) -> Dataset:
-        dataset = await self.get_object_by_identifier("dataset", dataset_id)
+    async def get_dataset(self, request: GetDatasetRequest) -> Dataset:
+        dataset = await self.get_object_by_identifier("dataset", request.dataset_id)
         if dataset is None:
-            raise DatasetNotFoundError(dataset_id)
+            raise DatasetNotFoundError(request.dataset_id)
         return dataset
 
-    async def register_dataset(
-        self,
-        purpose: DatasetPurpose,
-        source: DataSource,
-        metadata: dict[str, Any] | None = None,
-        dataset_id: str | None = None,
-    ) -> Dataset:
+    async def register_dataset(self, request: RegisterDatasetRequest) -> Dataset:
+        purpose = request.purpose
+        source = request.source
+        metadata = request.metadata
+        dataset_id = request.dataset_id
         if isinstance(source, dict):
             if source["type"] == "uri":
                 source = URIDataSource.parse_obj(source)
@@ -86,6 +86,6 @@ class DatasetsRoutingTable(CommonRoutingTableImpl, Datasets):
         await self.register_object(dataset)
         return dataset
 
-    async def unregister_dataset(self, dataset_id: str) -> None:
-        dataset = await self.get_dataset(dataset_id)
+    async def unregister_dataset(self, request: UnregisterDatasetRequest) -> None:
+        dataset = await self.get_dataset(GetDatasetRequest(dataset_id=request.dataset_id))
         await self.unregister_object(dataset)

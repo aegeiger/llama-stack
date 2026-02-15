@@ -5,9 +5,36 @@
 # the root directory of this source tree.
 
 
+from unittest.mock import AsyncMock
+
 import pytest
 
-from llama_stack.apis.agents.openai_responses import (
+from llama_stack.providers.inline.agents.meta_reference.responses.utils import (
+    _extract_citations_from_text,
+    convert_chat_choice_to_response_message,
+    convert_response_content_to_chat_content,
+    convert_response_input_to_chat_messages,
+    convert_response_text_to_chat_response_format,
+    get_message_type_by_role,
+    is_function_tool_call,
+)
+from llama_stack_api.inference import (
+    OpenAIAssistantMessageParam,
+    OpenAIChatCompletionContentPartImageParam,
+    OpenAIChatCompletionContentPartTextParam,
+    OpenAIChatCompletionResponseMessage,
+    OpenAIChatCompletionToolCall,
+    OpenAIChatCompletionToolCallFunction,
+    OpenAIChoice,
+    OpenAIDeveloperMessageParam,
+    OpenAIResponseFormatJSONObject,
+    OpenAIResponseFormatJSONSchema,
+    OpenAIResponseFormatText,
+    OpenAISystemMessageParam,
+    OpenAIToolMessageParam,
+    OpenAIUserMessageParam,
+)
+from llama_stack_api.openai_responses import (
     OpenAIResponseAnnotationFileCitation,
     OpenAIResponseInputFunctionToolCallOutput,
     OpenAIResponseInputMessageContentImage,
@@ -20,36 +47,18 @@ from llama_stack.apis.agents.openai_responses import (
     OpenAIResponseText,
     OpenAIResponseTextFormat,
 )
-from llama_stack.apis.inference import (
-    OpenAIAssistantMessageParam,
-    OpenAIChatCompletionContentPartImageParam,
-    OpenAIChatCompletionContentPartTextParam,
-    OpenAIChatCompletionToolCall,
-    OpenAIChatCompletionToolCallFunction,
-    OpenAIChoice,
-    OpenAIDeveloperMessageParam,
-    OpenAIResponseFormatJSONObject,
-    OpenAIResponseFormatJSONSchema,
-    OpenAIResponseFormatText,
-    OpenAISystemMessageParam,
-    OpenAIToolMessageParam,
-    OpenAIUserMessageParam,
-)
-from llama_stack.providers.inline.agents.meta_reference.responses.utils import (
-    _extract_citations_from_text,
-    convert_chat_choice_to_response_message,
-    convert_response_content_to_chat_content,
-    convert_response_input_to_chat_messages,
-    convert_response_text_to_chat_response_format,
-    get_message_type_by_role,
-    is_function_tool_call,
-)
+
+
+@pytest.fixture
+def mock_files_api():
+    """Mock files API for testing."""
+    return AsyncMock()
 
 
 class TestConvertChatChoiceToResponseMessage:
     async def test_convert_string_content(self):
         choice = OpenAIChoice(
-            message=OpenAIAssistantMessageParam(content="Test message"),
+            message=OpenAIChatCompletionResponseMessage(content="Test message"),
             finish_reason="stop",
             index=0,
         )
@@ -62,33 +71,36 @@ class TestConvertChatChoiceToResponseMessage:
         assert isinstance(result.content[0], OpenAIResponseOutputMessageContentOutputText)
         assert result.content[0].text == "Test message"
 
-    async def test_convert_text_param_content(self):
+    async def test_convert_none_content(self):
         choice = OpenAIChoice(
-            message=OpenAIAssistantMessageParam(
-                content=[OpenAIChatCompletionContentPartTextParam(text="Test text param")]
+            message=OpenAIChatCompletionResponseMessage(
+                content=None,
             ),
             finish_reason="stop",
             index=0,
         )
 
-        with pytest.raises(ValueError) as exc_info:
-            await convert_chat_choice_to_response_message(choice)
+        result = await convert_chat_choice_to_response_message(choice)
 
-        assert "does not yet support output content type" in str(exc_info.value)
+        assert result.role == "assistant"
+        assert result.status == "completed"
+        assert len(result.content) == 1
+        assert isinstance(result.content[0], OpenAIResponseOutputMessageContentOutputText)
+        assert result.content[0].text == ""
 
 
 class TestConvertResponseContentToChatContent:
-    async def test_convert_string_content(self):
-        result = await convert_response_content_to_chat_content("Simple string")
+    async def test_convert_string_content(self, mock_files_api):
+        result = await convert_response_content_to_chat_content("Simple string", mock_files_api)
         assert result == "Simple string"
 
-    async def test_convert_text_content_parts(self):
+    async def test_convert_text_content_parts(self, mock_files_api):
         content = [
             OpenAIResponseInputMessageContentText(text="First part"),
             OpenAIResponseOutputMessageContentOutputText(text="Second part"),
         ]
 
-        result = await convert_response_content_to_chat_content(content)
+        result = await convert_response_content_to_chat_content(content, mock_files_api)
 
         assert len(result) == 2
         assert isinstance(result[0], OpenAIChatCompletionContentPartTextParam)
@@ -96,10 +108,10 @@ class TestConvertResponseContentToChatContent:
         assert isinstance(result[1], OpenAIChatCompletionContentPartTextParam)
         assert result[1].text == "Second part"
 
-    async def test_convert_image_content(self):
+    async def test_convert_image_content(self, mock_files_api):
         content = [OpenAIResponseInputMessageContentImage(image_url="https://example.com/image.jpg", detail="high")]
 
-        result = await convert_response_content_to_chat_content(content)
+        result = await convert_response_content_to_chat_content(content, mock_files_api)
 
         assert len(result) == 1
         assert isinstance(result[0], OpenAIChatCompletionContentPartImageParam)

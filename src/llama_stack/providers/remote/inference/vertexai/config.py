@@ -9,7 +9,7 @@ from typing import Any
 from pydantic import BaseModel, Field, SecretStr
 
 from llama_stack.providers.utils.inference.model_registry import RemoteInferenceProviderConfig
-from llama_stack.schema_utils import json_schema_type
+from llama_stack_api import json_schema_type
 
 
 class VertexAIProviderDataValidator(BaseModel):
@@ -19,7 +19,7 @@ class VertexAIProviderDataValidator(BaseModel):
     )
     vertex_location: str | None = Field(
         default=None,
-        description="Google Cloud location for Vertex AI (e.g., us-central1)",
+        description="Google Cloud location for Vertex AI (e.g., global)",
     )
 
 
@@ -31,7 +31,7 @@ class VertexAIConfig(RemoteInferenceProviderConfig):
         description="Google Cloud project ID for Vertex AI",
     )
     location: str = Field(
-        default="us-central1",
+        default="global",
         description="Google Cloud location for Vertex AI",
     )
 
@@ -39,7 +39,7 @@ class VertexAIConfig(RemoteInferenceProviderConfig):
     def sample_run_config(
         cls,
         project: str = "${env.VERTEX_AI_PROJECT:=}",
-        location: str = "${env.VERTEX_AI_LOCATION:=us-central1}",
+        location: str = "${env.VERTEX_AI_LOCATION:=global}",
         **kwargs,
     ) -> dict[str, Any]:
         return {

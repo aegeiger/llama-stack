@@ -3,28 +3,23 @@
 #
 # This source code is licensed under the terms described in the LICENSE file in
 # the root directory of this source tree.
-import asyncio
-from typing import Any
 
-from llama_stack.apis.agents import (
-    Order,
-)
-from llama_stack.apis.agents.openai_responses import (
+from llama_stack.core.datatypes import AccessRule
+from llama_stack.core.storage.datatypes import ResponsesStoreReference, SqlStoreReference
+from llama_stack.core.storage.sqlstore.authorized_sqlstore import AuthorizedSqlStore
+from llama_stack.core.storage.sqlstore.sqlstore import sqlstore_impl
+from llama_stack.log import get_logger
+from llama_stack_api import (
     ListOpenAIResponseInputItem,
     ListOpenAIResponseObject,
     OpenAIDeleteResponseObject,
+    OpenAIMessageParam,
     OpenAIResponseInput,
     OpenAIResponseObject,
     OpenAIResponseObjectWithInput,
+    Order,
 )
-from llama_stack.apis.inference import OpenAIMessageParam
-from llama_stack.core.datatypes import AccessRule
-from llama_stack.core.storage.datatypes import ResponsesStoreReference, SqlStoreReference, StorageBackendType
-from llama_stack.log import get_logger
-
-from ..sqlstore.api import ColumnDefinition, ColumnType
-from ..sqlstore.authorized_sqlstore import AuthorizedSqlStore
-from ..sqlstore.sqlstore import _SQLSTORE_BACKENDS, sqlstore_impl
+from llama_stack_api.internal.sqlstore import ColumnDefinition, ColumnType
 
 logger = get_logger(name=__name__, category="openai_responses")
 
@@ -55,30 +50,14 @@ class ResponsesStore:
 
         self.policy = policy
         self.sql_store = None
-        self.enable_write_queue = True
-
-        # Async write queue and worker control
-        self._queue: (
-            asyncio.Queue[tuple[OpenAIResponseObject, list[OpenAIResponseInput], list[OpenAIMessageParam]]] | None
-        ) = None
-        self._worker_tasks: list[asyncio.Task[Any]] = []
-        self._max_write_queue_size: int = self.reference.max_write_queue_size
-        self._num_writers: int = max(1, self.reference.num_writers)
 
     async def initialize(self):
         """Create the necessary tables if they don't exist."""
         base_store = sqlstore_impl(self.reference)
         self.sql_store = AuthorizedSqlStore(base_store, self.policy)
 
-        backend_config = _SQLSTORE_BACKENDS.get(self.reference.backend)
-        if backend_config is None:
-            raise ValueError(
-                f"Unregistered SQL backend '{self.reference.backend}'. Registered backends: {sorted(_SQLSTORE_BACKENDS)}"
-            )
-        if backend_config.type == StorageBackendType.SQL_SQLITE:
-            self.enable_write_queue = False
         await self.sql_store.create_table(
-            "openai_responses",
+            self.reference.table_name,
             {
                 "id": ColumnDefinition(type=ColumnType.STRING, primary_key=True),
                 "created_at": ColumnType.INTEGER,
@@ -95,32 +74,12 @@ class ResponsesStore:
             },
         )
 
-        if self.enable_write_queue:
-            self._queue = asyncio.Queue(maxsize=self._max_write_queue_size)
-            for _ in range(self._num_writers):
-                self._worker_tasks.append(asyncio.create_task(self._worker_loop()))
-        else:
-            logger.debug("Write queue disabled for SQLite to avoid concurrency issues")
-
     async def shutdown(self) -> None:
-        if not self._worker_tasks:
-            return
-        if self._queue is not None:
-            await self._queue.join()
-        for t in self._worker_tasks:
-            if not t.done():
-                t.cancel()
-        for t in self._worker_tasks:
-            try:
-                await t
-            except asyncio.CancelledError:
-                pass
-        self._worker_tasks.clear()
+        return
 
     async def flush(self) -> None:
-        """Wait for all queued writes to complete. Useful for testing."""
-        if self.enable_write_queue and self._queue is not None:
-            await self._queue.join()
+        """Maintained for compatibility; no-op now that writes are synchronous."""
+        return
 
     async def store_response_object(
         self,
@@ -128,31 +87,41 @@ class ResponsesStore:
         input: list[OpenAIResponseInput],
         messages: list[OpenAIMessageParam],
     ) -> None:
-        if self.enable_write_queue:
-            if self._queue is None:
-                raise ValueError("Responses store is not initialized")
-            try:
-                self._queue.put_nowait((response_object, input, messages))
-            except asyncio.QueueFull:
-                logger.warning(f"Write queue full; adding response id={getattr(response_object, 'id', '<unknown>')}")
-                await self._queue.put((response_object, input, messages))
-        else:
-            await self._write_response_object(response_object, input, messages)
+        await self._write_response_object(response_object, input, messages)
 
-    async def _worker_loop(self) -> None:
-        assert self._queue is not None
-        while True:
-            try:
-                item = await self._queue.get()
-            except asyncio.CancelledError:
-                break
-            response_object, input, messages = item
-            try:
-                await self._write_response_object(response_object, input, messages)
-            except Exception as e:  # noqa: BLE001
-                logger.error(f"Error writing response object: {e}")
-            finally:
-                self._queue.task_done()
+    async def upsert_response_object(
+        self,
+        response_object: OpenAIResponseObject,
+        input: list[OpenAIResponseInput],
+        messages: list[OpenAIMessageParam],
+    ) -> None:
+        """Upsert response object using INSERT on first call, UPDATE on subsequent calls.
+
+        This method enables incremental persistence during streaming, allowing clients
+        to poll GET /v1/responses/{response_id} and see in-progress turn state.
+
+        :param response_object: The response object to store/update.
+        :param input: The input items for the response.
+        :param messages: The chat completion messages (for conversation continuity).
+        """
+        if self.sql_store is None:
+            raise ValueError("Responses store is not initialized")
+
+        data = response_object.model_dump()
+        data["input"] = [input_item.model_dump() for input_item in input]
+        data["messages"] = [msg.model_dump() for msg in messages]
+
+        await self.sql_store.upsert(
+            table=self.reference.table_name,
+            data={
+                "id": data["id"],
+                "created_at": data["created_at"],
+                "model": data["model"],
+                "response_object": data,
+            },
+            conflict_columns=["id"],
+            update_columns=["response_object"],
+        )
 
     async def _write_response_object(
         self,
@@ -168,7 +137,7 @@ class ResponsesStore:
         data["messages"] = [msg.model_dump() for msg in messages]
 
         await self.sql_store.insert(
-            "openai_responses",
+            self.reference.table_name,
             {
                 "id": data["id"],
                 "created_at": data["created_at"],
@@ -203,7 +172,7 @@ class ResponsesStore:
             where_conditions["model"] = model
 
         paginated_result = await self.sql_store.fetch_all(
-            table="openai_responses",
+            table=self.reference.table_name,
             where=where_conditions if where_conditions else None,
             order_by=[("created_at", order.value)],
             cursor=("id", after) if after else None,
@@ -226,7 +195,7 @@ class ResponsesStore:
             raise ValueError("Responses store is not initialized")
 
         row = await self.sql_store.fetch_one(
-            "openai_responses",
+            self.reference.table_name,
             where={"id": response_id},
         )
 
@@ -241,10 +210,10 @@ class ResponsesStore:
         if not self.sql_store:
             raise ValueError("Responses store is not initialized")
 
-        row = await self.sql_store.fetch_one("openai_responses", where={"id": response_id})
+        row = await self.sql_store.fetch_one(self.reference.table_name, where={"id": response_id})
         if not row:
             raise ValueError(f"Response with id {response_id} not found")
-        await self.sql_store.delete("openai_responses", where={"id": response_id})
+        await self.sql_store.delete(self.reference.table_name, where={"id": response_id})
         return OpenAIDeleteResponseObject(id=response_id)
 
     async def list_response_input_items(
@@ -314,19 +283,12 @@ class ResponsesStore:
         # Serialize messages to dict format for JSON storage
         messages_data = [msg.model_dump() for msg in messages]
 
-        # Upsert: try insert first, update if exists
-        try:
-            await self.sql_store.insert(
-                table="conversation_messages",
-                data={"conversation_id": conversation_id, "messages": messages_data},
-            )
-        except Exception:
-            # If insert fails due to ID conflict, update existing record
-            await self.sql_store.update(
-                table="conversation_messages",
-                data={"messages": messages_data},
-                where={"conversation_id": conversation_id},
-            )
+        await self.sql_store.upsert(
+            table="conversation_messages",
+            data={"conversation_id": conversation_id, "messages": messages_data},
+            conflict_columns=["conversation_id"],
+            update_columns=["messages"],
+        )
 
         logger.debug(f"Stored {len(messages)} messages for conversation {conversation_id}")
 

@@ -50,7 +50,7 @@ SETUP_DEFINITIONS: dict[str, Setup] = {
         name="ollama",
         description="Local Ollama provider with text + safety models",
         env={
-            "OLLAMA_URL": "http://0.0.0.0:11434",
+            "OLLAMA_URL": "http://0.0.0.0:11434/v1",
             "SAFETY_MODEL": "ollama/llama-guard3:1b",
         },
         defaults={
@@ -64,11 +64,31 @@ SETUP_DEFINITIONS: dict[str, Setup] = {
         name="ollama",
         description="Local Ollama provider with a vision model",
         env={
-            "OLLAMA_URL": "http://0.0.0.0:11434",
+            "OLLAMA_URL": "http://0.0.0.0:11434/v1",
         },
         defaults={
             "vision_model": "ollama/llama3.2-vision:11b",
             "embedding_model": "ollama/nomic-embed-text:v1.5",
+        },
+    ),
+    "ollama-postgres": Setup(
+        name="ollama-postgres",
+        description="Server-mode tests with Postgres-backed persistence",
+        env={
+            "OLLAMA_URL": "http://0.0.0.0:11434/v1",
+            "SAFETY_MODEL": "ollama/llama-guard3:1b",
+            "POSTGRES_HOST": "127.0.0.1",
+            "POSTGRES_PORT": "5432",
+            "POSTGRES_DB": "llamastack",
+            "POSTGRES_USER": "llamastack",
+            "POSTGRES_PASSWORD": "llamastack",
+            "LLAMA_STACK_LOGGING": "openai_responses=info",
+        },
+        defaults={
+            "text_model": "ollama/llama3.2:3b-instruct-fp16",
+            "embedding_model": "sentence-transformers/nomic-embed-text-v1.5",
+            "safety_model": "ollama/llama-guard3:1b",
+            "safety_shield": "llama-guard",
         },
     ),
     "vllm": Setup(
@@ -78,8 +98,16 @@ SETUP_DEFINITIONS: dict[str, Setup] = {
             "VLLM_URL": "http://localhost:8000/v1",
         },
         defaults={
-            "text_model": "vllm/meta-llama/Llama-3.2-1B-Instruct",
+            "text_model": "vllm/Qwen/Qwen3-0.6B",
             "embedding_model": "sentence-transformers/nomic-embed-text-v1.5",
+            "rerank_model": "vllm/Qwen/Qwen3-Reranker-0.6B",
+        },
+    ),
+    "bedrock": Setup(
+        name="bedrock",
+        description="AWS Bedrock provider with OpenAI GPT-OSS model (us-west-2)",
+        defaults={
+            "text_model": "bedrock/openai.gpt-oss-20b-1:0",
         },
     ),
     "gpt": Setup(
@@ -153,6 +181,17 @@ SETUP_DEFINITIONS: dict[str, Setup] = {
             "text_model": "groq/llama-3.3-70b-versatile",
         },
     ),
+    "llama-cpp-server": Setup(
+        name="llama-cpp-server",
+        description="llama.cpp server provider with OpenAI-compatible API",
+        env={
+            "LLAMA_CPP_SERVER_URL": "http://localhost:8080",
+        },
+        defaults={
+            "text_model": "llama-cpp-server/qwen2.5",
+            "embedding_model": "sentence-transformers/nomic-embed-text-v1.5",
+        },
+    ),
 }
 
 
@@ -169,6 +208,11 @@ SUITE_DEFINITIONS: dict[str, Suite] = {
         roots=base_roots,
         default_setup="ollama",
     ),
+    "base-vllm-subset": Suite(
+        name="base-vllm-subset",
+        roots=["tests/integration/inference"],
+        default_setup="vllm",
+    ),
     "responses": Suite(
         name="responses",
         roots=["tests/integration/responses"],
@@ -178,5 +222,20 @@ SUITE_DEFINITIONS: dict[str, Suite] = {
         name="vision",
         roots=["tests/integration/inference/test_vision_inference.py"],
         default_setup="ollama-vision",
+    ),
+    "reasoning": Suite(
+        name="reasoning",
+        roots=["tests/integration/responses/test_reasoning.py"],
+        default_setup="vllm",
+    ),
+    # Bedrock-specific tests with pre-recorded responses (no live API calls in CI)
+    "bedrock": Suite(
+        name="bedrock",
+        roots=[
+            "tests/integration/inference/test_openai_completion.py::test_openai_chat_completion_non_streaming",
+            "tests/integration/inference/test_openai_completion.py::test_openai_chat_completion_streaming",
+            "tests/integration/inference/test_openai_completion.py::test_inference_store",
+        ],
+        default_setup="bedrock",
     ),
 }

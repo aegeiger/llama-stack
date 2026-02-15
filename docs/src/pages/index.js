@@ -13,7 +13,7 @@ function HomepageHeader() {
         <div className={styles.heroContent}>
           <h1 className={styles.heroTitle}>Build AI Applications with Llama Stack</h1>
           <p className={styles.heroSubtitle}>
-            Unified APIs for Inference, RAG, Agents, Tools, Safety, and Telemetry
+            Unified APIs for Inference, RAG, Agents, Tools, and Safety
           </p>
           <div className={styles.buttons}>
             <Link
@@ -25,6 +25,11 @@ function HomepageHeader() {
               className={clsx('button button--primary button--lg', styles.apiButton)}
               to="/docs/api/llama-stack-specification">
               📚 API Reference
+            </Link>
+            <Link
+              className={clsx('button button--primary button--lg', styles.apiButton)}
+              to="/blog">
+              📝 Blogs
             </Link>
           </div>
         </div>
@@ -51,7 +56,7 @@ ollama run llama3.2:3b --keepalive 60m
 uv run --with llama-stack llama stack list-deps starter | xargs -L1 uv pip install
 
 # Run Llama Stack server
-OLLAMA_URL=http://localhost:11434 uv run --with llama-stack llama stack run starter
+OLLAMA_URL=http://localhost:11434/v1 uv run --with llama-stack llama stack run starter
 
 # Try the Python SDK
 from llama_stack_client import LlamaStackClient
@@ -206,7 +211,7 @@ export default function Home() {
   return (
     <Layout
       title="Build AI Applications"
-      description="The open-source framework for building generative AI applications with unified APIs for Inference, RAG, Agents, Tools, Safety, and Telemetry.">
+      description="The open-source framework for building generative AI applications with unified APIs for Inference, RAG, Agents, Tools, Safety, and Evals.">
       <HomepageHeader />
       <main>
         <QuickStart />

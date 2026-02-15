@@ -6,8 +6,6 @@
 
 """In-memory telemetry collector for library-client tests."""
 
-from typing import Any
-
 import opentelemetry.metrics as otel_metrics
 import opentelemetry.trace as otel_trace
 from opentelemetry import metrics, trace
@@ -17,48 +15,43 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
-import llama_stack.core.telemetry.telemetry as telemetry_module
-
-from .base import BaseTelemetryCollector, SpanStub
+from .base import BaseTelemetryCollector, MetricStub, SpanStub
 
 
+# TODO: Fix thi to work with Automatic Instrumentation
 class InMemoryTelemetryCollector(BaseTelemetryCollector):
+    """In-memory telemetry collector for library-client tests.
+
+    Converts OpenTelemetry span objects to SpanStub objects to ensure
+    consistent interface with OTLP collector used in server mode.
+    """
+
     def __init__(self, span_exporter: InMemorySpanExporter, metric_reader: InMemoryMetricReader) -> None:
+        super().__init__()
         self._span_exporter = span_exporter
         self._metric_reader = metric_reader
 
-    def _snapshot_spans(self) -> tuple[Any, ...]:
+    def _snapshot_spans(self) -> tuple[SpanStub, ...]:
         spans = []
         for span in self._span_exporter.get_finished_spans():
-            trace_id = None
-            span_id = None
-            context = getattr(span, "context", None)
-            if context:
-                trace_id = f"{context.trace_id:032x}"
-                span_id = f"{context.span_id:016x}"
-            else:
-                trace_id = getattr(span, "trace_id", None)
-                span_id = getattr(span, "span_id", None)
-
-            stub = SpanStub(
-                span.name,
-                span.attributes,
-                getattr(span, "resource", None),
-                getattr(span, "events", None),
-                trace_id,
-                span_id,
-            )
-            spans.append(stub)
-
+            spans.append(self._create_span_stub_from_opentelemetry(span))
         return tuple(spans)
 
-    def _snapshot_metrics(self) -> Any | None:
+    def _snapshot_metrics(self) -> tuple[MetricStub, ...] | None:
         data = self._metric_reader.get_metrics_data()
-        if data and data.resource_metrics:
-            resource_metric = data.resource_metrics[0]
+        if not data or not data.resource_metrics:
+            return None
+
+        metric_stubs = []
+        for resource_metric in data.resource_metrics:
             if resource_metric.scope_metrics:
-                return resource_metric.scope_metrics[0].metrics
-        return None
+                for scope_metric in resource_metric.scope_metrics:
+                    for metric in scope_metric.metrics:
+                        metric_stub = self._extract_metric_from_opentelemetry(metric)
+                        if metric_stub:
+                            metric_stubs.append(metric_stub)
+
+        return tuple(metric_stubs) if metric_stubs else None
 
     def _clear_impl(self) -> None:
         self._span_exporter.clear()
@@ -81,13 +74,10 @@ class InMemoryTelemetryManager:
         meter_provider = MeterProvider(metric_readers=[metric_reader])
         metrics.set_meter_provider(meter_provider)
 
-        telemetry_module._TRACER_PROVIDER = tracer_provider
-
         self.collector = InMemoryTelemetryCollector(span_exporter, metric_reader)
         self._tracer_provider = tracer_provider
         self._meter_provider = meter_provider
 
     def shutdown(self) -> None:
-        telemetry_module._TRACER_PROVIDER = None
         self._tracer_provider.shutdown()
         self._meter_provider.shutdown()

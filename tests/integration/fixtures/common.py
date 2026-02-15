@@ -14,15 +14,21 @@ import tempfile
 import time
 from urllib.parse import urlparse
 
+# Initialize logging early before any loggers get created
+from llama_stack.log import setup_logging
+
+setup_logging()
+
 import pytest
 import requests
 import yaml
 from llama_stack_client import LlamaStackClient
 from openai import OpenAI
 
-from llama_stack import LlamaStackAsLibraryClient
-from llama_stack.core.datatypes import VectorStoresConfig
+from llama_stack.core.datatypes import QualifiedModel, VectorStoresConfig
+from llama_stack.core.library_client import LlamaStackAsLibraryClient
 from llama_stack.core.stack import run_config_from_adhoc_config_spec
+from llama_stack.core.utils.config_resolution import resolve_config_or_distro
 from llama_stack.env import get_env_or_fail
 
 DEFAULT_PORT = 8321
@@ -160,7 +166,7 @@ def client_with_models(
     providers = [p for p in client.providers.list() if p.api == "inference"]
     assert len(providers) > 0, "No inference providers found"
 
-    model_ids = {m.identifier for m in client.models.list()}
+    model_ids = {m.id for m in client.models.list()}
 
     if text_model_id and text_model_id not in model_ids:
         raise ValueError(f"text_model_id {text_model_id} not found")
@@ -224,6 +230,24 @@ def llama_stack_client(request):
     return client
 
 
+def parse_vector_io_provider(config_string: str) -> str:
+    # Split the string into individual key-value pairs
+    pairs = config_string.split(",")
+    for pair in pairs:
+        # Split each pair into key and value
+        key_value = pair.split("=")
+        if len(key_value) == 2 and key_value[0].strip() == "vector_io":
+            # Extract the provider after the last '::' if it exists
+            return key_value[1].strip()
+    return "inline::sentence-transformers"
+
+
+def extract_model(model: str | None, default: str) -> str:
+    if not model or "/" not in model:
+        return default
+    return model.split("/", 1)[1]
+
+
 def instantiate_llama_stack_client(session):
     config = session.config.getoption("--stack-config")
     if not config:
@@ -233,10 +257,21 @@ def instantiate_llama_stack_client(session):
         raise ValueError("You must specify either --stack-config or LLAMA_STACK_CONFIG")
 
     # Handle server:<config_name> format or server:<config_name>:<port>
+    # Also handles server:<distro>::<run_file.yaml> format
     if config.startswith("server:"):
-        parts = config.split(":")
-        config_name = parts[1]
-        port = int(parts[2]) if len(parts) > 2 else int(os.environ.get("LLAMA_STACK_PORT", DEFAULT_PORT))
+        # Strip the "server:" prefix first
+        config_part = config[7:]  # len("server:") == 7
+
+        # Check for :: (distro::runfile format)
+        if "::" in config_part:
+            config_name = config_part
+            port = int(os.environ.get("LLAMA_STACK_PORT", DEFAULT_PORT))
+        else:
+            # Single colon format: either <name> or <name>:<port>
+            parts = config_part.split(":")
+            config_name = parts[0]
+            port = int(parts[1]) if len(parts) > 1 else int(os.environ.get("LLAMA_STACK_PORT", DEFAULT_PORT))
+
         base_url = f"http://localhost:{port}"
 
         force_restart = os.environ.get("LLAMA_STACK_TEST_FORCE_SERVER_RESTART") == "1"
@@ -290,14 +325,28 @@ def instantiate_llama_stack_client(session):
 
         # --stack-config bypasses template so need this to set default embedding model
         if "vector_io" in config and "inference" in config:
+            if "inline" in session.config.getoption("embedding_model"):
+                provider_id = "inline::sentence-transformers"
+            else:
+                provider_id = parse_vector_io_provider(config)
+            passed_model = extract_model(session.config.getoption("embedding_model"), "nomic-ai/nomic-embed-text-v1.5")
+            passed_emb = session.config.getoption("embedding_dimension")
+
             run_config.vector_stores = VectorStoresConfig(
-                embedding_model_id="inline::sentence-transformers/nomic-ai/nomic-embed-text-v1.5"
+                default_embedding_model=QualifiedModel(
+                    provider_id=provider_id,
+                    model_id=passed_model,
+                    embedding_dimensions=passed_emb,
+                )
             )
 
         run_config_file = tempfile.NamedTemporaryFile(delete=False, suffix=".yaml")
         with open(run_config_file.name, "w") as f:
             yaml.dump(run_config.model_dump(mode="json"), f)
         config = run_config_file.name
+    elif "::" in config:
+        # Handle distro::config.yaml format (e.g., ci-tests::run.yaml)
+        config = str(resolve_config_or_distro(config))
 
     client = LlamaStackAsLibraryClient(
         config,
@@ -323,7 +372,13 @@ def require_server(llama_stack_client):
 @pytest.fixture(scope="session")
 def openai_client(llama_stack_client, require_server):
     base_url = f"{llama_stack_client.base_url}/v1"
-    return OpenAI(base_url=base_url, api_key="fake")
+    client = OpenAI(base_url=base_url, api_key="fake", max_retries=0, timeout=30.0)
+    yield client
+    # Cleanup: close HTTP connections
+    try:
+        client.close()
+    except Exception:
+        pass
 
 
 @pytest.fixture(params=["openai_client", "client_with_models"])

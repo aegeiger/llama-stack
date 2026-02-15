@@ -11,20 +11,21 @@ from unittest.mock import patch
 import pytest
 from openai import AsyncOpenAI
 
-# Import the real Pydantic response types instead of using Mocks
-from llama_stack.apis.inference import (
-    OpenAIAssistantMessageParam,
-    OpenAIChatCompletion,
-    OpenAIChoice,
-    OpenAIEmbeddingData,
-    OpenAIEmbeddingsResponse,
-    OpenAIEmbeddingUsage,
-)
 from llama_stack.testing.api_recorder import (
     APIRecordingMode,
     ResponseStorage,
     api_recording,
     normalize_inference_request,
+)
+
+# Import the real Pydantic response types instead of using Mocks
+from llama_stack_api import (
+    OpenAIChatCompletion,
+    OpenAIChatCompletionResponseMessage,
+    OpenAIChoice,
+    OpenAIEmbeddingData,
+    OpenAIEmbeddingsResponse,
+    OpenAIEmbeddingUsage,
 )
 
 
@@ -43,7 +44,7 @@ def real_openai_chat_response():
         choices=[
             OpenAIChoice(
                 index=0,
-                message=OpenAIAssistantMessageParam(
+                message=OpenAIChatCompletionResponseMessage(
                     role="assistant", content="Hello! I'm doing well, thank you for asking."
                 ),
                 finish_reason="stop",

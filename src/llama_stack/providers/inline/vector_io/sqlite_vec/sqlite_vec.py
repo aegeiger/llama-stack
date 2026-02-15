@@ -5,6 +5,7 @@
 # the root directory of this source tree.
 
 import asyncio
+import json
 import re
 import sqlite3
 import struct
@@ -14,23 +15,31 @@ import numpy as np
 import sqlite_vec  # type: ignore[import-untyped]
 from numpy.typing import NDArray
 
-from llama_stack.apis.common.errors import VectorStoreNotFoundError
-from llama_stack.apis.files import Files
-from llama_stack.apis.inference import Inference
-from llama_stack.apis.vector_io import Chunk, QueryChunksResponse, VectorIO
-from llama_stack.apis.vector_stores import VectorStore
+from llama_stack.core.storage.kvstore import kvstore_impl
 from llama_stack.log import get_logger
-from llama_stack.providers.datatypes import VectorStoresProtocolPrivate
-from llama_stack.providers.utils.kvstore import kvstore_impl
-from llama_stack.providers.utils.kvstore.api import KVStore
 from llama_stack.providers.utils.memory.openai_vector_store_mixin import OpenAIVectorStoreMixin
 from llama_stack.providers.utils.memory.vector_store import (
     RERANKER_TYPE_RRF,
-    ChunkForDeletion,
     EmbeddingIndex,
     VectorStoreWithIndex,
 )
+from llama_stack.providers.utils.vector_io import load_embedded_chunk_with_backward_compat
 from llama_stack.providers.utils.vector_io.vector_utils import WeightedInMemoryAggregator
+from llama_stack_api import (
+    ChunkForDeletion,
+    DeleteChunksRequest,
+    EmbeddedChunk,
+    Files,
+    Inference,
+    InsertChunksRequest,
+    QueryChunksRequest,
+    QueryChunksResponse,
+    VectorIO,
+    VectorStore,
+    VectorStoreNotFoundError,
+    VectorStoresProtocolPrivate,
+)
+from llama_stack_api.internal.kvstore import KVStore
 
 logger = get_logger(name=__name__, category="vector_io")
 
@@ -53,7 +62,7 @@ def serialize_vector(vector: list[float]) -> bytes:
     return struct.pack(f"{len(vector)}f", *vector)
 
 
-def _create_sqlite_connection(db_path):
+def _create_sqlite_connection(db_path: str):
     """Create a SQLite connection with sqlite_vec extension loaded."""
     connection = sqlite3.connect(db_path)
     connection.enable_load_extension(True)
@@ -137,14 +146,16 @@ class SQLiteVecIndex(EmbeddingIndex):
 
         await asyncio.to_thread(_drop_tables)
 
-    async def add_chunks(self, chunks: list[Chunk], embeddings: NDArray, batch_size: int = 500):
+    async def add_chunks(self, embedded_chunks: list[EmbeddedChunk], batch_size: int = 500):
         """
-        Add new chunks along with their embeddings using batch inserts.
-        For each chunk, we insert its JSON into the metadata table and then insert its
+        Add new embedded chunks using batch inserts.
+        For each embedded chunk, we insert the chunk JSON into the metadata table and then insert its
         embedding (serialized to raw bytes) into the virtual table using the assigned rowid.
         If any insert fails, the transaction is rolled back to maintain consistency.
         Also inserts chunk content into FTS table for keyword search support.
         """
+        chunks = embedded_chunks  # EmbeddedChunk now inherits from Chunk
+        embeddings = np.array([ec.embedding for ec in embedded_chunks], dtype=np.float32)
         assert all(isinstance(chunk.content, str) for chunk in chunks), "SQLiteVecIndex only supports text chunks"
 
         def _execute_all_batch_inserts():
@@ -229,11 +240,12 @@ class SQLiteVecIndex(EmbeddingIndex):
             if score < score_threshold:
                 continue
             try:
-                chunk = Chunk.model_validate_json(chunk_json)
+                chunk_data = json.loads(chunk_json)
+                embedded_chunk = load_embedded_chunk_with_backward_compat(chunk_data)
             except Exception as e:
                 logger.error(f"Error parsing chunk JSON for id {_id}: {e}")
                 continue
-            chunks.append(chunk)
+            chunks.append(embedded_chunk)
             scores.append(score)
         return QueryChunksResponse(chunks=chunks, scores=scores)
 
@@ -270,11 +282,12 @@ class SQLiteVecIndex(EmbeddingIndex):
             if score > -score_threshold:
                 continue
             try:
-                chunk = Chunk.model_validate_json(chunk_json)
+                chunk_data = json.loads(chunk_json)
+                embedded_chunk = load_embedded_chunk_with_backward_compat(chunk_data)
             except Exception as e:
                 logger.error(f"Error parsing chunk JSON for id {_id}: {e}")
                 continue
-            chunks.append(chunk)
+            chunks.append(embedded_chunk)
             scores.append(score)
         return QueryChunksResponse(chunks=chunks, scores=scores)
 
@@ -308,13 +321,14 @@ class SQLiteVecIndex(EmbeddingIndex):
         vector_response = await self.query_vector(embedding, k, score_threshold)
         keyword_response = await self.query_keyword(query_string, k, score_threshold)
 
-        # Convert responses to score dictionaries using chunk_id
+        # Convert responses to score dictionaries using chunk_id (EmbeddedChunk inherits from Chunk)
         vector_scores = {
-            chunk.chunk_id: score for chunk, score in zip(vector_response.chunks, vector_response.scores, strict=False)
+            embedded_chunk.chunk_id: score
+            for embedded_chunk, score in zip(vector_response.chunks, vector_response.scores, strict=False)
         }
         keyword_scores = {
-            chunk.chunk_id: score
-            for chunk, score in zip(keyword_response.chunks, keyword_response.scores, strict=False)
+            embedded_chunk.chunk_id: score
+            for embedded_chunk, score in zip(keyword_response.chunks, keyword_response.scores, strict=False)
         }
 
         # Combine scores using the reranking utility
@@ -329,10 +343,10 @@ class SQLiteVecIndex(EmbeddingIndex):
         # Filter by score threshold
         filtered_items = [(doc_id, score) for doc_id, score in top_k_items if score >= score_threshold]
 
-        # Create a map of chunk_id to chunk for both responses
-        chunk_map = {c.chunk_id: c for c in vector_response.chunks + keyword_response.chunks}
+        # Create a map of chunk_id to embedded_chunk for both responses
+        chunk_map = {ec.chunk_id: ec for ec in vector_response.chunks + keyword_response.chunks}
 
-        # Use the map to look up chunks by their IDs
+        # Use the map to look up embedded chunks by their IDs
         chunks = []
         scores = []
         for doc_id, score in filtered_items:
@@ -382,9 +396,8 @@ class SQLiteVecVectorIOAdapter(OpenAIVectorStoreMixin, VectorIO, VectorStoresPro
     """
 
     def __init__(self, config, inference_api: Inference, files_api: Files | None) -> None:
-        super().__init__(files_api=files_api, kvstore=None)
+        super().__init__(inference_api=inference_api, files_api=files_api, kvstore=None)
         self.config = config
-        self.inference_api = inference_api
         self.cache: dict[str, VectorStoreWithIndex] = {}
         self.vector_store_table = None
 
@@ -412,6 +425,14 @@ class SQLiteVecVectorIOAdapter(OpenAIVectorStoreMixin, VectorIO, VectorStoresPro
         return [v.vector_store for v in self.cache.values()]
 
     async def register_vector_store(self, vector_store: VectorStore) -> None:
+        if self.kvstore is None:
+            raise RuntimeError("KVStore not initialized. Call initialize() before registering vector stores.")
+
+        # Save to kvstore for persistence
+        key = f"{VECTOR_DBS_PREFIX}{vector_store.identifier}"
+        await self.kvstore.set(key=key, value=vector_store.model_dump_json())
+
+        # Create and cache the index
         index = await SQLiteVecIndex.create(
             vector_store.embedding_dimension, self.config.db_path, vector_store.identifier
         )
@@ -421,13 +442,16 @@ class SQLiteVecVectorIOAdapter(OpenAIVectorStoreMixin, VectorIO, VectorStoresPro
         if vector_store_id in self.cache:
             return self.cache[vector_store_id]
 
-        if self.vector_store_table is None:
+        # Try to load from kvstore
+        if self.kvstore is None:
+            raise RuntimeError("KVStore not initialized. Call initialize() before using vector stores.")
+
+        key = f"{VECTOR_DBS_PREFIX}{vector_store_id}"
+        vector_store_data = await self.kvstore.get(key)
+        if not vector_store_data:
             raise VectorStoreNotFoundError(vector_store_id)
 
-        vector_store = self.vector_store_table.get_vector_store(vector_store_id)
-        if not vector_store:
-            raise VectorStoreNotFoundError(vector_store_id)
-
+        vector_store = VectorStore.model_validate_json(vector_store_data)
         index = VectorStoreWithIndex(
             vector_store=vector_store,
             index=SQLiteVecIndex(
@@ -447,26 +471,23 @@ class SQLiteVecVectorIOAdapter(OpenAIVectorStoreMixin, VectorIO, VectorStoresPro
         await self.cache[vector_store_id].index.delete()
         del self.cache[vector_store_id]
 
-    async def insert_chunks(self, vector_store_id: str, chunks: list[Chunk], ttl_seconds: int | None = None) -> None:
-        index = await self._get_and_cache_vector_store_index(vector_store_id)
+    async def insert_chunks(self, request: InsertChunksRequest) -> None:
+        index = await self._get_and_cache_vector_store_index(request.vector_store_id)
         if not index:
-            raise VectorStoreNotFoundError(vector_store_id)
-        # The VectorStoreWithIndex helper is expected to compute embeddings via the inference_api
-        # and then call our index's add_chunks.
-        await index.insert_chunks(chunks)
+            raise VectorStoreNotFoundError(request.vector_store_id)
+        # The VectorStoreWithIndex helper validates embeddings and calls the index's add_chunks method
+        await index.insert_chunks(request)
 
-    async def query_chunks(
-        self, vector_store_id: str, query: Any, params: dict[str, Any] | None = None
-    ) -> QueryChunksResponse:
-        index = await self._get_and_cache_vector_store_index(vector_store_id)
+    async def query_chunks(self, request: QueryChunksRequest) -> QueryChunksResponse:
+        index = await self._get_and_cache_vector_store_index(request.vector_store_id)
         if not index:
-            raise VectorStoreNotFoundError(vector_store_id)
-        return await index.query_chunks(query, params)
+            raise VectorStoreNotFoundError(request.vector_store_id)
+        return await index.query_chunks(request)
 
-    async def delete_chunks(self, store_id: str, chunks_for_deletion: list[ChunkForDeletion]) -> None:
+    async def delete_chunks(self, request: DeleteChunksRequest) -> None:
         """Delete chunks from a sqlite_vec index."""
-        index = await self._get_and_cache_vector_store_index(store_id)
+        index = await self._get_and_cache_vector_store_index(request.vector_store_id)
         if not index:
-            raise VectorStoreNotFoundError(store_id)
+            raise VectorStoreNotFoundError(request.vector_store_id)
 
-        await index.index.delete_chunks(chunks_for_deletion)
+        await index.index.delete_chunks(request.chunks)
