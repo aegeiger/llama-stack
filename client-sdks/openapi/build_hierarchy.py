@@ -278,6 +278,48 @@ def process_openapi(input_file: str, output_file: str, hierarchy_file: str) -> N
         "tags_with_endpoints": sorted(tags_with_endpoints),
         "tags_without_endpoints": sorted(tags_without_endpoints),
     }
+
+    # Propagate proxy methods from enriched spec to hierarchy file, resolving
+    # nesting paths to the actual tag names used in the hierarchy.
+    raw_proxy_methods = spec.get("x-proxy-methods", [])
+    if raw_proxy_methods:
+        resolved_proxy_methods = []
+        for pm in raw_proxy_methods:
+            parent_path = pm["parent_nesting_path"]
+            child_path = pm["child_nesting_path"]
+            method_name = pm["method_name"]
+
+            # The parent tag is the last element of the parent nesting path
+            parent_tag = parent_path[-1].lower()
+
+            # The child tag is the key in api_hierarchy under the parent.
+            # Look up the child resource name in the hierarchy to find its
+            # resolved tag name (which may include a parent prefix for collisions).
+            child_resource = child_path[-1].lower()
+            parent_children = api_hierarchy.get(parent_tag, {})
+            # Find the child tag — it's either the simple name or a prefixed version
+            child_tag = None
+            for key in parent_children:
+                if key == child_resource or key.endswith(f"_{child_resource}"):
+                    child_tag = key
+                    break
+
+            if child_tag is None:
+                print(f"  Warning: Could not resolve child tag for {child_resource} under {parent_tag}")
+                continue
+
+            resolved_proxy_methods.append(
+                {
+                    "parent_tag": parent_tag,
+                    "child_tag": child_tag,
+                    "method_name": method_name,
+                }
+            )
+
+        if resolved_proxy_methods:
+            hierarchy_data["proxy_methods"] = resolved_proxy_methods
+            print(f"  Resolved {len(resolved_proxy_methods)} proxy method(s) for hierarchy file")
+
     with open(hierarchy_file, "w") as f:
         yaml_handler.dump(hierarchy_data, f)
 

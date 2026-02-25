@@ -212,8 +212,19 @@ class UnprocessableEntityException(ApiException):
 
 
 class RateLimitException(ApiException):
-    """Exception for HTTP 429 Too Many Requests."""
+    """Exception for HTTP 429 Rate Limit."""
     pass
+
+
+# Aliases for compatibility with _exceptions.py naming convention
+BadRequestError = BadRequestException
+AuthenticationError = UnauthorizedException
+PermissionDeniedError = ForbiddenException
+NotFoundError = NotFoundException
+ConflictError = ConflictException
+UnprocessableEntityError = UnprocessableEntityException
+RateLimitError = RateLimitException
+InternalServerError = ServiceException
 
 
 def render_path(path_to_item):
