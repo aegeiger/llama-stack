@@ -40,10 +40,16 @@ class {{classname}}:
             _request_timeout=_request_timeout
         )
         {{#async}}await {{/async}}response_data.read()
-        return self.api_client.response_deserialize(
+        _deserialized = self.api_client.response_deserialize(
             response_data=response_data,
             response_types_map=_response_types_map,
         ).data
+        # Unwrap List*Response wrappers to return the data field directly
+        {{#vendorExtensions.x-unwrap-list-response}}
+        if _deserialized is not None and hasattr(_deserialized, 'data'):
+            return _deserialized.data
+        {{/vendorExtensions.x-unwrap-list-response}}
+        return _deserialized
 
 
     @validate_call

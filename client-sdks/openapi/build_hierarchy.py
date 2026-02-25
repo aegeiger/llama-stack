@@ -150,7 +150,7 @@ def mark_unwrappable_list_responses(spec: dict[str, Any]) -> int:
                 continue
 
             schema_name = ref.split("/")[-1]
-            if not (schema_name.startswith("List") and schema_name.endswith("Response")):
+            if not ("List" in schema_name and schema_name.endswith("Response")):
                 continue
 
             schema_def = schemas.get(schema_name, {})

@@ -391,6 +391,12 @@ class ApiClient:
             # model definition for request.
             if hasattr(obj, 'to_dict') and callable(getattr(obj, 'to_dict')):
                 obj_dict = obj.to_dict()
+                # Handle Pydantic models that return None from to_dict()
+                if obj_dict is None:
+                    obj_dict = {}
+                # Handle oneOf wrappers that return primitives (str, int, etc.) from to_dict()
+                elif isinstance(obj_dict, self.PRIMITIVE_TYPES):
+                    return obj_dict
             else:
                 obj_dict = obj.__dict__
 
