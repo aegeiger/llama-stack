@@ -4,9 +4,7 @@
 
 from __future__ import annotations
 
-{{#async}}
 import base64
-{{/async}}
 import copy
 import http.client as httplib
 import logging
@@ -15,12 +13,9 @@ from logging import FileHandler
 import multiprocessing
 {{/async}}
 import sys
+
 from typing import Any, ClassVar, Literal, TypedDict
 from typing_extensions import NotRequired, Self
-
-{{^async}}
-import urllib3
-{{/async}}
 
 {{#hasHttpSignatureMethods}}
 from {{packageName}}.signing import HttpSigningConfiguration
@@ -190,10 +185,14 @@ class Configuration:
     :param ssl_ca_cert: str - the path to a file of concatenated CA certificates
       in PEM format.
     :param retries: Number of retries for API requests.
+    :param timeout: Default timeout for API requests in seconds. Can be overridden per-request.
     :param ca_cert_data: verify the peer using concatenated CA certificate data
       in PEM (str) or DER (bytes) format.
     :param cert_file: the path to a client certificate file, for mTLS.
     :param key_file: the path to a client key file, for mTLS.
+    :param http2: Enable HTTP/2 support. Default is False. Requires 'h2' package.
+    :param follow_redirects: Whether to follow HTTP redirects. Default is True.
+    :param base_url: Alias for host. If both host and base_url are provided, host will be used.
 
 {{#hasAuthMethods}}
     :Example:
@@ -300,14 +299,20 @@ conf = {{{packageName}}}.Configuration(
         ignore_operation_servers: bool=False,
         ssl_ca_cert: str | None=None,
         retries: int | None = None,
+        timeout: int | float | None = None,
         ca_cert_data: str | bytes | None = None,
         cert_file: str | None=None,
         key_file: str | None=None,
+        http2: bool = False,
+        follow_redirects: bool = True,
         *,
         debug: bool | None = None,
+        base_url: str | None=None,
     ) -> None:
         """Constructor
         """
+        host = base_url if host is None else host
+        self.base_url = host
         self._base_path = "{{{basePath}}}" if host is None else host
         """Default Base url
         """
@@ -359,9 +364,7 @@ conf = {{{packageName}}}.Configuration(
         """Logging Settings
         """
         self.logger["package_logger"] = logging.getLogger("{{packageName}}")
-        {{^async}}
-        self.logger["urllib3_logger"] = logging.getLogger("urllib3")
-        {{/async}}
+        self.logger["httpx_logger"] = logging.getLogger("httpx")
         self.logger_format = '%(asctime)s %(levelname)s %(message)s'
         """Log format
         """
@@ -399,13 +402,6 @@ conf = {{{packageName}}}.Configuration(
         self.key_file = key_file
         """client key file
         """
-        self.assert_hostname = None
-        """Set this to True/False to enable/disable SSL hostname verification.
-        """
-        self.tls_server_name = None
-        """SSL/TLS Server Name Indication (SNI)
-           Set this to the SNI value expected by the server.
-        """
 
         {{#async}}
         self.connection_pool_maxsize = 100
@@ -415,10 +411,7 @@ conf = {{{packageName}}}.Configuration(
         {{/async}}
         {{^async}}
         self.connection_pool_maxsize = multiprocessing.cpu_count() * 5
-        """urllib3 connection pool's maximum number of connections saved
-           per pool. urllib3 uses 1 connection as default value, but this is
-           not the best value when you are making a lot of possibly parallel
-           requests to the same host, which is often the case here.
+        """httpx connection pool's maximum number of connections.
            cpu_count * 5 is used as default value to increase performance.
         """
         {{/async}}
@@ -433,14 +426,20 @@ conf = {{{packageName}}}.Configuration(
         """Safe chars for path_param
         """
         self.retries = retries
-        """Adding retries to override urllib3 default value 3
+        """Number of retries for API requests.
+        """
+        self.timeout = timeout
+        """Default timeout for API requests in seconds
+        """
+        self.http2 = http2
+        """Enable HTTP/2 support
+        """
+        self.follow_redirects = follow_redirects
+        """Whether to follow HTTP redirects
         """
         # Enable client side validation
         self.client_side_validation = True
 
-        self.socket_options = None
-        """Options to pass down to the underlying urllib3 socket
-        """
 
         self.datetime_format = "{{{datetimeFormat}}}"
         """datetime format
@@ -617,23 +616,11 @@ conf = {{{packageName}}}.Configuration(
 
         :return: The token for basic HTTP authentication.
         """
-        username = ""
-        if self.username is not None:
-            username = self.username
-        password = ""
-        if self.password is not None:
-            password = self.password
-
-        {{#async}}
-        return "Basic " + base64.b64encode(
-            (username + ":" + password).encode('utf-8')
-        ).decode('utf-8')
-        {{/async}}
-        {{^async}}
-        return urllib3.util.make_headers(
-            basic_auth=username + ':' + password
-        ).get('authorization')
-        {{/async}}
+        username = self.username or ""
+        password = self.password or ""
+        credentials = f"{username}:{password}"
+        encoded = base64.b64encode(credentials.encode('utf-8')).decode('ascii')
+        return f"Basic {encoded}"
 
     def auth_settings(self)-> AuthSettings:
         """Gets Auth Settings dict for api client.
@@ -736,11 +723,6 @@ conf = {{{packageName}}}.Configuration(
                         ]
                         {{/-last}}
                         {{/enumValues}}
-                        {{^enumValues}}
-                        {{#async}}
-                        'enum_values': []
-                        {{/async}}
-                        {{/enumValues}}
                         }{{^-last}},{{/-last}}
                 {{#-last}}
                     }
@@ -783,7 +765,6 @@ conf = {{{packageName}}}.Configuration(
                 variable_name, variable['default_value'])
 
             if 'enum_values' in variable \
-                    and variable['enum_values'] \
                     and used_value not in variable['enum_values']:
                 raise ValueError(
                     "The variable `{0}` in the host URL has invalid value "

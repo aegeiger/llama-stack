@@ -121,7 +121,17 @@ class ApiException(OpenApiException):
                     self.body = http_resp.data.decode('utf-8')
                 except Exception:
                     pass
-            self.headers = http_resp.headers
+            self.headers = http_resp.getheaders()
+
+    @property
+    def message(self) -> str | None:
+        """Alias for reason to match httpx-style exceptions."""
+        return self.reason
+
+    @property
+    def status_code(self) -> int | None:
+        """Alias for status to match httpx-style exceptions."""
+        return self.status
 
     @classmethod
     def from_response(
