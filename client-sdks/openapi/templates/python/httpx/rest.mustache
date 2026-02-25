@@ -2,12 +2,12 @@
 
 {{>partial_header}}
 
+from __future__ import annotations
 
 import io
 import json
 import re
 import ssl
-from typing import Optional, Union
 
 import httpx
 
@@ -65,7 +65,7 @@ class RESTClientObject:
         self.proxy = configuration.proxy
         self.proxy_headers = configuration.proxy_headers
 
-        self.pool_manager: Optional[httpx.AsyncClient] = None
+        self.pool_manager: httpx.AsyncClient | None = None
 
     async def close(self):
         if self.pool_manager is not None:
