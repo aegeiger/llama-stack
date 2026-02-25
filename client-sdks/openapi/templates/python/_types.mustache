@@ -19,6 +19,7 @@ from typing import (
     Union,
 )
 from typing_extensions import (
+    Annotated,
     Literal,
     Protocol,
     TypeAlias,
@@ -31,7 +32,8 @@ from typing_extensions import (
 
 import httpx
 import pydantic
-from httpx import URL, AsyncBaseTransport, BaseTransport, Proxy, Response, Timeout
+from pydantic import BeforeValidator
+from httpx import URL, Proxy, Timeout, Response, BaseTransport, AsyncBaseTransport
 
 if TYPE_CHECKING:
     from ._models import BaseModel
@@ -87,6 +89,50 @@ HttpxFileTypes = (
     tuple[str | None, HttpxFileContent, str | None, Mapping[str, str]]
 )
 HttpxRequestFiles = Mapping[str, HttpxFileTypes] | Sequence[tuple[str, HttpxFileTypes]]
+
+
+# File upload validator - converts file-like objects to bytes or keeps them as-is
+def _validate_file_input(v: Any) -> Any:
+    """
+    Validator for file uploads that accepts:
+    - bytes
+    - str (file path)
+    - file-like objects (IO[bytes], BytesIO, etc.)
+    - tuples of (filename, content)
+    """
+    # If it's already bytes or str, pass through
+    if isinstance(v, bytes | str):
+        return v
+
+    # If it's a tuple (filename, content), validate the content part
+    if isinstance(v, tuple) and len(v) >= 2:
+        filename, content = v[0], v[1]
+        # Recursively validate the content
+        validated_content = _validate_file_input(content)
+        # Return the tuple with validated content
+        if len(v) == 2:
+            return (filename, validated_content)
+        else:
+            return (filename, validated_content) + v[2:]
+
+    # If it has a read method (file-like object), it's valid
+    if hasattr(v, 'read'):
+        return v
+
+    # If it's a PathLike, convert to string
+    if isinstance(v, PathLike):
+        return str(v)
+
+    # Otherwise, pass through and let httpx handle it
+    return v
+
+
+# Type alias for file upload parameters that accepts file-like objects
+# This is used for multipart/form-data file uploads
+FileUploadContent = Annotated[
+    bytes | str | IO[bytes] | tuple[str, bytes | IO[bytes]],
+    BeforeValidator(_validate_file_input)
+]
 
 # Workaround to support (cast_to: Type[ResponseT]) -> ResponseT
 # where ResponseT includes `None`. In order to support directly
