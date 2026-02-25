@@ -162,6 +162,43 @@ def mark_unwrappable_list_responses(spec: dict[str, Any]) -> int:
     return count
 
 
+def mark_streaming_operations(spec: dict[str, Any]) -> int:
+    """Add x-streaming vendor extensions for operations with text/event-stream responses.
+
+    Scans all operations for text/event-stream response content types and stamps:
+    - x-streaming: true
+    - x-streaming-type: <schema name> (the SSE response schema)
+
+    The streaming type's discriminator (if any) is read at runtime from the
+    generated model class, so we don't need to duplicate it here.
+
+    Returns the number of operations marked.
+    """
+    count = 0
+
+    for _, path_item in spec.get("paths", {}).items():
+        for method in HTTP_METHODS:
+            operation = path_item.get(method)
+            if not isinstance(operation, dict):
+                continue
+
+            response_200 = operation.get("responses", {}).get("200", {})
+            sse_content = response_200.get("content", {}).get("text/event-stream")
+            if not sse_content:
+                continue
+
+            schema_ref = sse_content.get("schema", {}).get("$ref", "")
+            if not schema_ref:
+                continue
+
+            stream_type = schema_ref.split("/")[-1]
+            operation["x-streaming"] = True
+            operation["x-streaming-type"] = stream_type
+            count += 1
+
+    return count
+
+
 def process_openapi(input_file: str, output_file: str, hierarchy_file: str) -> None:
     """Process OpenAPI spec to extract hierarchy and prepare for code generation."""
     yaml_handler = yaml.YAML()
@@ -254,6 +291,10 @@ def process_openapi(input_file: str, output_file: str, hierarchy_file: str) -> N
     unwrapped = mark_unwrappable_list_responses(spec)
     if unwrapped:
         print(f"  Marked {unwrapped} endpoints for list response unwrapping")
+
+    streaming = mark_streaming_operations(spec)
+    if streaming:
+        print(f"  Marked {streaming} endpoints with streaming type metadata")
 
     # --- Write output ---
     with open(output_file, "w") as f:
